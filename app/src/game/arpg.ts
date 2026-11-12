@@ -9,11 +9,14 @@ import { Input } from "./input";
 import { AudioSystem } from "./audio";
 import {
   HEROES, MAPS, WORLD_SIZE, XP_BASE, WAVE_PERIOD, BOSS_PERIOD, SATORU_DURATION,
+  ALL_ENEMY_KINDS, COOP_BOSSES, COOP_MAP, kindSprite,
 } from "./heroes";
 import type { HeroDef, EnemyKindDef, MapDef } from "./heroes";
 import { paintMap } from "./maps";
+import { Net, makeRoomCode } from "./net";
+import type { SnapMsg, EvMsg, LobbyPlayer } from "./net";
 
-type GameState = "select" | "play" | "pause" | "over";
+type GameState = "select" | "lobby" | "play" | "pause" | "over";
 
 /** Риг частей тела в нормализованных координатах спрайта (совпадает с parts/*.png). */
 const RIG_HUMANOID: Record<string, [number, number, number, number]> = {
@@ -45,6 +48,46 @@ interface Enemy {
   anim: number; sprite: string;
   /** Замах перед ударом: >0 — идёт телеграф атаки, урон при достижении 0. */
   windup: number;
+  /** Сетевой id (кооп): назначает хост, по нему клиент сверяет снапшоты. */
+  nid?: number;
+  /** Цель интерполяции на клиенте. */
+  tx?: number; ty?: number;
+}
+
+/** Игрок в коопе (в соло-режиме он один — «me»). */
+interface PlayerEnt {
+  pid: string;
+  hero: HeroDef;
+  isLocal: boolean;
+  x: number; y: number; facing: number;
+  vx: number; vy: number; walkPhase: number; moving: boolean;
+  hp: number; maxHp: number; mana: number; maxMana: number;
+  level: number; xp: number; xpNext: number; dmgMul: number;
+  cdBasic: number; cdQ: number; cdE: number; cdR: number; cdT: number;
+  dashT: number; dashDx: number; dashDy: number; dashDmgMul: number; dashHits: Set<Enemy>;
+  iframes: number; shieldT: number; speedBuffT: number; swingT: number; hurtFlash: number;
+  alive: boolean;
+  /** Цель интерполяции для удалённых игроков. */
+  tx: number; ty: number;
+  trail: Array<{ x: number; y: number; life: number }>;
+}
+
+function makePlayer(pid: string, hero: HeroDef, isLocal: boolean): PlayerEnt {
+  return {
+    pid, hero, isLocal,
+    x: WORLD_SIZE / 2, y: WORLD_SIZE / 2, facing: 0,
+    vx: 0, vy: 0, walkPhase: 0, moving: false,
+    hp: hero.hp, maxHp: hero.hp, mana: 100, maxMana: 100,
+    level: 1, xp: 0, xpNext: XP_BASE, dmgMul: 1,
+    cdBasic: 0, cdQ: 0, cdE: 0, cdR: 0, cdT: 0,
+    dashT: 0, dashDx: 0, dashDy: 0, dashDmgMul: 0, dashHits: new Set(),
+    iframes: 0, shieldT: 0, speedBuffT: 0, swingT: 0, hurtFlash: 0,
+    alive: true, tx: WORLD_SIZE / 2, ty: WORLD_SIZE / 2, trail: [],
+  };
+}
+
+function heroById(id: string): HeroDef {
+  return HEROES.find((h) => h.id === id) ?? HEROES[0];
 }
 
 interface Corpse { x: number; y: number; sprite: string; life: number; flip: boolean; scale: number }
@@ -54,6 +97,8 @@ interface Proj {
   dmg: number; r: number; friendly: boolean; pierce: boolean;
   life: number; color: string; kind: string; disarm: boolean;
   hitSet: Set<Enemy> | null;
+  /** Сетевой id (кооп) и владелец (для начисления опыта). */
+  nid?: number; owner?: PlayerEnt;
 }
 
 interface Particle { x: number; y: number; vx: number; vy: number; life: number; maxLife: number; color: string; size: number }
@@ -61,11 +106,13 @@ interface Floater { x: number; y: number; text: string; color: string; life: num
 interface Orb { x: number; y: number; heal: number; t: number }
 interface Announce { text: string; sub: string; life: number; max: number }
 /** Ударная волна: расширяющееся кольцо; если dmg > 0 — наносит урон один раз каждому врагу в кольце. */
-interface WaveFx { x: number; y: number; r: number; maxR: number; life: number; maxLife: number; color: string; dmg: number; width: number; hitSet: Set<Enemy> | null }
+interface WaveFx { x: number; y: number; r: number; maxR: number; life: number; maxLife: number; color: string; dmg: number; width: number; hitSet: Set<Enemy> | null; owner?: PlayerEnt }
 /** Временный источник света (вспышка взрыва/заклинания). */
 interface TempLight { x: number; y: number; r: number; life: number; maxLife: number }
 /** Отложенный залп (Даша, «Тотальный отстрел»). */
-interface Volley { t: number; ang0: number }
+interface Volley { t: number; ang0: number; p: PlayerEnt }
+/** Кот САТОРУ (в коопе может быть несколько — по одному на игрока). */
+interface SatoruEnt { x: number; y: number; life: number; swipeCd: number; pid: string }
 
 const BEST_KEY = "svadebnaya-diabla.best.v1";
 type BestMap = Partial<Record<string, { time: number; kills: number; level: number }>>;
@@ -108,29 +155,67 @@ export class Arpg {
   /** Кэш радиальных свечений: вместо createRadialGradient на каждый снаряд в каждом кадре. */
   private glowCache = new Map<string, HTMLCanvasElement>();
   private mapCanvas: HTMLCanvasElement | null = null;
-  private walkPhase = 0;
-  private trail: Array<{ x: number; y: number; life: number }> = [];
   private corpses: Corpse[] = [];
 
   private hero: HeroDef = HEROES[0];
   private map: MapDef = MAPS.arena;
   private selIndex = 0;
 
-  // игрок
-  private px = WORLD_SIZE / 2; private py = WORLD_SIZE / 2;
-  private facing = 0;
-  private hp = 100; private maxHp = 100;
-  private level = 1; private xp = 0; private xpNext = XP_BASE;
-  private dmgMul = 1;
-  private cdBasic = 0; private cdQ = 0; private cdE = 0; private cdR = 0; private cdT = 0;
+  // игроки (в соло — только me)
+  private me: PlayerEnt = makePlayer("me", HEROES[0], true);
+  private players: PlayerEnt[] = [];
   /** Хит-стоп: микрозамедление времени при убийствах (сочность ударов, как в Diablo). */
   private hitStop = 0;
-  /** Инерция движения игрока. */
-  private pvx = 0; private pvy = 0;
-  private mana = 100; private maxMana = 100;
-  private dashT = 0; private dashDx = 0; private dashDy = 0; private dashDmgMul = 0; private dashHits = new Set<Enemy>();
-  private iframes = 0; private shieldT = 0; private speedBuffT = 0;
-  private swingT = 0; private hurtFlash = 0;
+
+  // сеть (кооп)
+  private net: Net | null = null;
+  private netMode: "off" | "host" | "client" = "off";
+  private myPid = "me";
+  private hostPeerId = ""; // trystero-id хоста, узнаём из входящих сообщений
+  private netPeerOf = new Map<string, string>(); // pid -> trystero peerId (на хосте)
+  private lobbyPlayers: LobbyPlayer[] = [];
+  private lobbyT = 0;           // периодическая рассылка состояния лобби
+  private lobbyWait = 0;        // таймер ожидания ответа лобби на клиенте
+  private lobbyError = "";
+  private selScreen: "heroes" | "join" = "heroes";
+  private joinCode = "";
+  private netSendT = 0;
+  private nidSeq = 1;
+  private enemyByNid = new Map<number, Enemy>();
+  private projByNid = new Map<number, Proj>();
+  private prevWave = 1;
+  private prevAlive = true;
+
+  // акцессоры к полям локального игрока — основной код симуляции не меняется
+  private get px(): number { return this.me.x; } private set px(v: number) { this.me.x = v; }
+  private get py(): number { return this.me.y; } private set py(v: number) { this.me.y = v; }
+  private get facing(): number { return this.me.facing; } private set facing(v: number) { this.me.facing = v; }
+  private get pvx(): number { return this.me.vx; } private set pvx(v: number) { this.me.vx = v; }
+  private get pvy(): number { return this.me.vy; } private set pvy(v: number) { this.me.vy = v; }
+  private get walkPhase(): number { return this.me.walkPhase; } private set walkPhase(v: number) { this.me.walkPhase = v; }
+  private get hp(): number { return this.me.hp; } private set hp(v: number) { this.me.hp = v; }
+  private get maxHp(): number { return this.me.maxHp; } private set maxHp(v: number) { this.me.maxHp = v; }
+  private get mana(): number { return this.me.mana; } private set mana(v: number) { this.me.mana = v; }
+  private get maxMana(): number { return this.me.maxMana; } private set maxMana(v: number) { this.me.maxMana = v; }
+  private get level(): number { return this.me.level; } private set level(v: number) { this.me.level = v; }
+  private get xp(): number { return this.me.xp; } private set xp(v: number) { this.me.xp = v; }
+  private get xpNext(): number { return this.me.xpNext; } private set xpNext(v: number) { this.me.xpNext = v; }
+  private get dmgMul(): number { return this.me.dmgMul; } private set dmgMul(v: number) { this.me.dmgMul = v; }
+  private get cdBasic(): number { return this.me.cdBasic; } private set cdBasic(v: number) { this.me.cdBasic = v; }
+  private get cdQ(): number { return this.me.cdQ; } private set cdQ(v: number) { this.me.cdQ = v; }
+  private get cdE(): number { return this.me.cdE; } private set cdE(v: number) { this.me.cdE = v; }
+  private get cdR(): number { return this.me.cdR; } private set cdR(v: number) { this.me.cdR = v; }
+  private get cdT(): number { return this.me.cdT; } private set cdT(v: number) { this.me.cdT = v; }
+  private get dashT(): number { return this.me.dashT; } private set dashT(v: number) { this.me.dashT = v; }
+  private get dashDx(): number { return this.me.dashDx; } private set dashDx(v: number) { this.me.dashDx = v; }
+  private get dashDy(): number { return this.me.dashDy; } private set dashDy(v: number) { this.me.dashDy = v; }
+  private get dashDmgMul(): number { return this.me.dashDmgMul; } private set dashDmgMul(v: number) { this.me.dashDmgMul = v; }
+  private get dashHits(): Set<Enemy> { return this.me.dashHits; } private set dashHits(v: Set<Enemy>) { this.me.dashHits = v; }
+  private get iframes(): number { return this.me.iframes; } private set iframes(v: number) { this.me.iframes = v; }
+  private get shieldT(): number { return this.me.shieldT; } private set shieldT(v: number) { this.me.shieldT = v; }
+  private get speedBuffT(): number { return this.me.speedBuffT; } private set speedBuffT(v: number) { this.me.speedBuffT = v; }
+  private get swingT(): number { return this.me.swingT; } private set swingT(v: number) { this.me.swingT = v; }
+  private get hurtFlash(): number { return this.me.hurtFlash; } private set hurtFlash(v: number) { this.me.hurtFlash = v; }
 
   // декали (кровь/следы) и слой освещения
   private decals: Array<{ x: number; y: number; r: number; color: string; alpha: number }> = [];
@@ -152,7 +237,7 @@ export class Arpg {
   private wave = 1; private hpMul = 1; private dmgMulE = 1;
   private spawnT = 0; private nextBossAt = BOSS_PERIOD;
   private bossAlive = false;
-  private satoru: { x: number; y: number; life: number; swipeCd: number } | null = null;
+  private satorus: SatoruEnt[] = [];
   private shake = 0;
   private overStats = { time: 0, kills: 0, level: 1, wave: 1 };
   private best: BestMap = loadBest();
@@ -160,6 +245,7 @@ export class Arpg {
   // мышь
   private mx = 0; private my = 0; private mouseDown = false;
   private cardRects: Array<{ x: number; y: number; w: number; h: number }> = [];
+  private menuBtns: Array<{ x: number; y: number; w: number; h: number; act: string }> = [];
   private unsub: Array<() => void> = [];
 
   constructor(private canvas: HTMLCanvasElement) {
@@ -276,37 +362,213 @@ export class Arpg {
     this.loop.stop();
     this.input.dispose();
     this.audio.dispose();
+    void this.net?.leave();
+    this.net = null;
     for (const f of this.unsub) f();
     this.unsub = [];
   }
 
+  // ---------- сеть: лобби ----------
+
+  private createLobby(): void {
+    this.leaveNet();
+    const code = makeRoomCode();
+    this.net = new Net(code);
+    this.netMode = "host";
+    this.myPid = "HOST";
+    this.lobbyPlayers = [{ pid: "HOST", hero: HEROES[this.selIndex].id, host: true }];
+    this.lobbyError = "";
+    this.state = "lobby";
+    this.wireNet();
+    this.audio.sfx("ui");
+  }
+
+  private joinLobby(code: string): void {
+    this.leaveNet();
+    this.net = new Net(code);
+    this.netMode = "client";
+    this.myPid = "C" + Math.random().toString(36).slice(2, 8).toUpperCase();
+    this.lobbyPlayers = [];
+    this.hostPeerId = "";
+    this.lobbyError = "";
+    this.lobbyWait = 15; // ждём первую рассылку лобби от хоста
+    this.state = "lobby";
+    this.wireNet();
+    this.audio.sfx("ui");
+  }
+
+  private leaveNet(): void {
+    void this.net?.leave();
+    this.net = null;
+    this.netMode = "off";
+    this.netPeerOf.clear();
+  }
+
+  private wireNet(): void {
+    const net = this.net!;
+    net.onHero((d, peerId) => {
+      if (this.netMode !== "host") return;
+      const pid = (d as { pid?: string }).pid ?? peerId;
+      this.netPeerOf.set(pid, peerId);
+      const ex = this.lobbyPlayers.find((p) => p.pid === pid);
+      if (ex) ex.hero = d.hero;
+      else if (this.lobbyPlayers.length < 6) this.lobbyPlayers.push({ pid, hero: d.hero, host: false });
+      this.broadcastLobby();
+    });
+    net.onPeerLeave((peerId) => {
+      if (this.netMode === "host") {
+        const pid = [...this.netPeerOf.entries()].find(([, v]) => v === peerId)?.[0];
+        if (pid) {
+          this.netPeerOf.delete(pid);
+          const lp = this.lobbyPlayers.findIndex((p) => p.pid === pid);
+          if (lp >= 0) { this.lobbyPlayers.splice(lp, 1); this.broadcastLobby(); }
+          const pl = this.players.findIndex((p) => p.pid === pid);
+          if (pl >= 0 && this.state === "play") {
+            this.announce(`${this.players[pl].hero.name} ВЫБЫЛ`, "игрок отключился");
+            this.players.splice(pl, 1);
+          }
+        }
+      } else if (this.netMode === "client" && peerId === this.hostPeerId) {
+        this.lobbyError = "хост отключился";
+        this.announce("СОЕДИНЕНИЕ ПОТЕРЯНО", "хост покинул игру");
+        this.leaveNet();
+        this.state = "select";
+        this.selScreen = "heroes";
+      }
+    });
+    net.onLobby((d, peerId) => {
+      if (this.netMode !== "client") return;
+      this.hostPeerId = peerId;
+      this.lobbyWait = 0;
+      const before = this.lobbyPlayers.map((p) => p.pid).join(",");
+      this.lobbyPlayers = d.pl;
+      // нас ещё нет в списке — представляемся
+      if (!d.pl.some((p) => p.pid === this.myPid)) {
+        net.sendHero({ pid: this.myPid, hero: HEROES[this.selIndex].id } as never, );
+      }
+      const after = d.pl.map((p) => p.pid).join(",");
+      if (before !== after) this.audio.sfx("ui");
+    });
+    net.onStart((d, peerId) => {
+      if (this.netMode !== "client") return;
+      this.hostPeerId = peerId;
+      const meLp = d.pl.find((p) => p.pid === this.myPid);
+      this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, d.pl);
+    });
+    net.onInp((d, peerId) => {
+      if (this.netMode !== "host" || this.state !== "play") return;
+      const p = this.players.find((pl) => this.netPeerOf.get(pl.pid) === peerId);
+      if (!p || !p.alive) return;
+      p.tx = d.x; p.ty = d.y; p.x = d.x; p.y = d.y; // позиция клиента авторитетна
+      p.facing = d.fx; p.walkPhase = d.wk; p.moving = d.mv;
+    });
+    net.onCast((d, peerId) => {
+      if (this.netMode !== "host" || this.state !== "play") return;
+      const p = this.players.find((pl) => this.netPeerOf.get(pl.pid) === peerId);
+      if (!p || !p.alive) return;
+      this.executeCast(p, d.k, d.dir);
+    });
+    net.onSnap((d) => {
+      if (this.netMode === "client" && this.state === "play") this.applySnap(d);
+    });
+    net.onEv((d) => {
+      if (this.netMode !== "client") return;
+      this.applyEv(d);
+    });
+  }
+
+  private broadcastLobby(): void {
+    this.net?.sendLobby({ pl: this.lobbyPlayers });
+  }
+
+  private hostStartCoop(): void {
+    if (!this.net) return;
+    this.net.sendStart({ pl: this.lobbyPlayers });
+    const meLp = this.lobbyPlayers.find((p) => p.pid === this.myPid);
+    this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, this.lobbyPlayers);
+  }
+
+  private updateLobby(dt: number): void {
+    // смена героя в лобби
+    for (let i = 0; i < HEROES.length; i++) {
+      if (this.input.consumeAction(`Digit${i + 1}`)) this.setLobbyHero(i);
+    }
+    if (this.input.consumeAction("Escape")) {
+      this.leaveNet();
+      this.state = "select";
+      this.selScreen = "heroes";
+      this.audio.sfx("ui");
+      return;
+    }
+    if (this.netMode === "host") {
+      this.lobbyT -= dt;
+      if (this.lobbyT <= 0) { this.lobbyT = 1; this.broadcastLobby(); }
+      if (this.input.consumeAction("Space") || this.input.consumeAction("Enter")) {
+        if (this.lobbyPlayers.length >= 2) this.hostStartCoop();
+        else this.lobbyError = "нужно хотя бы 2 игрока";
+      }
+    } else {
+      // клиент: ждём первый ответ хоста
+      if (!this.hostPeerId && this.lobbyWait > 0) {
+        this.lobbyWait -= dt;
+        if (this.lobbyWait <= 0) {
+          this.lobbyError = "лобби не найдено";
+          this.leaveNet();
+          this.state = "select";
+          this.selScreen = "join";
+        }
+      }
+    }
+  }
+
   // ---------- управление состоянием ----------
 
-  private startRun(hero: HeroDef): void {
+  private startRun(hero: HeroDef, coop = false, lobbyPl?: LobbyPlayer[]): void {
     this.hero = hero;
-    this.map = MAPS[hero.mapId];
-    this.mapCanvas = paintMap(hero.mapId);
-    this.px = WORLD_SIZE / 2; this.py = WORLD_SIZE / 2;
-    this.maxHp = hero.hp; this.hp = hero.hp;
-    this.level = 1; this.xp = 0; this.xpNext = XP_BASE;
-    this.dmgMul = 1;
+    if (coop && lobbyPl) {
+      this.map = COOP_MAP;
+      this.mapCanvas = paintMap("arena");
+      this.players = lobbyPl.map((lp, i) => {
+        const p = makePlayer(lp.pid, heroById(lp.hero), lp.pid === this.myPid);
+        const a = (i / lobbyPl.length) * Math.PI * 2;
+        p.x = WORLD_SIZE / 2 + Math.cos(a) * 140;
+        p.y = WORLD_SIZE / 2 + Math.sin(a) * 140;
+        p.tx = p.x; p.ty = p.y;
+        return p;
+      });
+      this.me = this.players.find((p) => p.isLocal) ?? this.players[0];
+      this.hero = this.me.hero;
+    } else {
+      this.map = MAPS[hero.mapId];
+      this.mapCanvas = paintMap(hero.mapId);
+      this.me = makePlayer("me", hero, true);
+      this.players = [this.me];
+    }
+    this.enemyByNid.clear(); this.projByNid.clear(); this.nidSeq = 1;
     this.cdBasic = this.cdQ = this.cdE = this.cdR = this.cdT = 0;
-    this.mana = this.maxMana;
-    this.dashT = 0; this.iframes = 0; this.shieldT = 0; this.speedBuffT = 0;
-    this.hitStop = 0; this.pvx = 0; this.pvy = 0;
+    this.hitStop = 0;
     this.enemies = []; this.projs = []; this.particles = []; this.floaters = []; this.orbs = [];
     this.decals = []; this.waves = []; this.tempLights = []; this.volleys = [];
     this.time = 0; this.kills = 0;
     this.wave = 1; this.hpMul = 1; this.dmgMulE = 1;
+    this.prevWave = 1; this.prevAlive = true;
     this.spawnT = 0.5; this.nextBossAt = BOSS_PERIOD; this.bossAlive = false;
-    this.satoru = null; this.shake = 0;
+    this.satorus = []; this.shake = 0;
+    this.netSendT = 0;
     this.state = "play";
     this.audio.startMusic();
-    this.announce(this.map.name.toUpperCase(), `${hero.name} в деле — ${this.map.subtitle}`);
+    this.announce(this.map.name.toUpperCase(), coop ? `${this.players.length} героя против всех армий` : `${hero.name} в деле — ${this.map.subtitle}`);
+    // хост рассылает стартовое состояние сразу, чтобы клиенты увидели мир
+    if (this.netMode === "host") this.sendSnap();
   }
 
   private gameOver(): void {
     this.overStats = { time: this.time, kills: this.kills, level: this.level, wave: this.wave };
+    if (this.netMode === "host") {
+      this.net?.sendEv({ t: "over", time: this.time, kills: this.kills, wave: this.wave });
+      this.leaveNetAfter();
+    }
+    if (this.netMode === "client") this.leaveNetAfter();
     const prev = this.best[this.hero.id];
     if (!prev || this.time > prev.time) {
       this.best[this.hero.id] = { time: Math.floor(this.time), kills: this.kills, level: this.level };
@@ -317,6 +579,14 @@ export class Arpg {
     this.audio.stopMusic();
   }
 
+  /** Аккуратно закрыть комнату после конца кооп-игры. */
+  private leaveNetAfter(): void {
+    const net = this.net;
+    this.net = null;
+    this.netMode = "off";
+    setTimeout(() => { void net?.leave(); }, 800); // даём последним пакетам уйти
+  }
+
   private announce(text: string, sub = ""): void {
     this.announces.push({ text, sub, life: 2.6, max: 2.6 });
   }
@@ -324,25 +594,23 @@ export class Arpg {
   // ---------- апдейт ----------
 
   private update(dt: number): void {
-    // глобальные клавиши
-    if (this.input.consumeAction("KeyM")) this.audio.toggleMute();
-    if (this.state === "select") {
-      for (let i = 0; i < HEROES.length; i++) {
-        if (this.input.consumeAction(`Digit${i + 1}`)) { this.selIndex = i; this.audio.sfx("ui"); }
-      }
-      if (this.input.consumeAction("Space") || this.input.consumeAction("Enter")) {
-        this.audio.sfx("ui");
-        this.startRun(HEROES[this.selIndex]);
-      }
-      return;
+    // глобальные клавиши (в меню M — это буква кода лобби, не мьют)
+    if (this.state === "play" || this.state === "pause") {
+      if (this.input.consumeAction("KeyM")) this.audio.toggleMute();
     }
+    if (this.state === "select") { this.updateSelect(); return; }
+    if (this.state === "lobby") { this.updateLobby(dt); return; }
     if (this.state === "over") {
-      if (this.input.consumeAction("Enter") || this.input.consumeAction("Space")) { this.state = "select"; this.audio.sfx("ui"); }
+      if (this.input.consumeAction("Enter") || this.input.consumeAction("Space")) { this.state = "select"; this.selScreen = "heroes"; this.audio.sfx("ui"); }
       return;
     }
     if (this.input.consumeAction("Escape")) {
-      this.state = this.state === "pause" ? "play" : "pause";
-      this.audio.sfx("ui");
+      if (this.netMode === "off") {
+        this.state = this.state === "pause" ? "play" : "pause";
+        this.audio.sfx("ui");
+      } else {
+        this.floaters.push({ x: this.px, y: this.py - 40, text: "В КООПЕ ПАУЗЫ НЕТ", color: "#c9a15a", life: 1 });
+      }
     }
     if (this.state === "pause") return;
 
@@ -350,46 +618,178 @@ export class Arpg {
     if (this.hitStop > 0) { this.hitStop -= dt; dt *= 0.12; }
 
     this.time += dt;
+    const authority = this.netMode !== "client";
+    const coop = this.netMode !== "off";
 
-    // волны: каждые WAVE_PERIOD секунд врагов больше и они сильнее
-    const w = Math.floor(this.time / WAVE_PERIOD) + 1;
-    if (w !== this.wave) {
-      this.wave = w;
-      this.hpMul = Math.pow(1.15, w - 1);
-      this.dmgMulE = Math.pow(1.11, w - 1);
-      this.announce(`ВОЛНА ${w}`, "врагов больше, и они сильнее!");
-      this.audio.sfx("explosion");
+    // волны: каждые WAVE_PERIOD секунд врагов больше и они сильнее (считает хост/соло)
+    if (authority) {
+      const w = Math.floor(this.time / WAVE_PERIOD) + 1;
+      if (w !== this.wave) {
+        this.wave = w;
+        this.hpMul = Math.pow(1.15, w - 1) * (coop ? 1 + (this.players.length - 1) * 0.4 : 1);
+        this.dmgMulE = Math.pow(1.11, w - 1);
+        this.announce(`ВОЛНА ${w}`, "врагов больше, и они сильнее!");
+        if (coop) this.net?.sendEv({ t: "ann", x: `ВОЛНА ${w}`, s: "врагов больше, и они сильнее!" });
+        this.audio.sfx("explosion");
+      }
     }
 
-    // таймеры игрока
-    this.cdBasic -= dt; this.cdQ -= dt; this.cdE -= dt; this.cdR -= dt; this.cdT -= dt;
-    this.mana = Math.min(this.maxMana, this.mana + 9 * dt);
-    this.iframes -= dt; this.shieldT -= dt; this.speedBuffT -= dt;
-    this.swingT -= dt; this.hurtFlash -= dt;
+    // таймеры всех игроков тикают на хосте (и локально у каждого — для отзывчивости)
+    for (const p of this.players) {
+      if (!p.isLocal && !authority) continue;
+      p.cdBasic -= dt; p.cdQ -= dt; p.cdE -= dt; p.cdR -= dt; p.cdT -= dt;
+      p.mana = Math.min(p.maxMana, p.mana + 9 * dt);
+      p.iframes -= dt; p.shieldT -= dt; p.speedBuffT -= dt;
+      p.swingT -= dt; p.hurtFlash -= dt;
+    }
 
-    // прицел
+    // прицел локального игрока
     const camX = this.camX(), camY = this.camY();
     this.facing = Math.atan2(camY + this.my - this.py, camX + this.mx - this.px);
 
-    // движение
+    // движение локального игрока (своя позиция авторитетна и в коопе)
+    if (this.me.alive) this.updateLocalMovement(dt);
+
+    // удалённые игроки: дэш-урон на хосте, следы на клиенте
+    for (const p of this.players) {
+      if (p.isLocal || !p.alive) continue;
+      if (authority && p.dashT > 0) {
+        p.dashT -= dt;
+        if (p.dashDmgMul > 0) {
+          for (const e of this.enemies) {
+            if (p.dashHits.has(e)) continue;
+            const d = Math.hypot(e.x - p.x, e.y - p.y);
+            if (d < e.radius + 30) {
+              p.dashHits.add(e);
+              this.damageEnemy(e, this.basicDmg(p) * p.dashDmgMul, p.dashDx * 320, p.dashDy * 320, p);
+            }
+          }
+        }
+      }
+      if (!authority && p.dashT > 0) {
+        p.trail.push({ x: p.x, y: p.y, life: 0.35 });
+        if (p.trail.length > 40) p.trail.shift();
+      }
+    }
+
+    // атаки локального игрока
+    if (this.me.alive) {
+      if (this.mouseDown && this.cdBasic <= 0 && this.dashT <= 0) this.tryCast("basic");
+      if (this.input.consumeAction("KeyQ") && this.cdQ <= 0) this.tryCast("q");
+      if (this.input.consumeAction("KeyE") && this.cdE <= 0) this.tryCast("e");
+      if (this.input.consumeAction("KeyR") && this.cdR <= 0) this.tryCast("r");
+      if ((this.input.consumeAction("KeyT") || this.input.consumeAction("KeyF")) && this.cdT <= 0) this.tryCast("t");
+    }
+
+    if (authority) {
+      // спавн
+      const cap = Math.min(70, 6 + this.wave * 3 + (coop ? (this.players.length - 1) * 5 : 0));
+      this.spawnT -= dt;
+      if (this.spawnT <= 0 && this.enemies.length < cap) {
+        this.spawnT = Math.max(0.7, 1.8 - this.wave * 0.08);
+        const batch = Math.min(cap - this.enemies.length, 2 + Math.floor(this.wave / 2));
+        for (let i = 0; i < batch; i++) this.spawnEnemy(false);
+      }
+      if (this.time >= this.nextBossAt) {
+        this.nextBossAt += BOSS_PERIOD;
+        this.spawnEnemy(true);
+        this.audio.sfx("lose");
+      }
+
+      this.updateEnemies(dt);
+      this.updateProjs(dt);
+      this.updateSatoru(dt);
+
+      // сферы здоровья
+      for (let i = this.orbs.length - 1; i >= 0; i--) {
+        const o = this.orbs[i];
+        o.t += dt;
+        const np = this.nearestPlayer(o.x, o.y);
+        if (!np) continue;
+        const d = Math.hypot(o.x - np.x, o.y - np.y);
+        if (d < 110 && d > 1) { o.x += (np.x - o.x) / d * 300 * dt; o.y += (np.y - o.y) / d * 300 * dt; }
+        if (d < 26) {
+          np.hp = Math.min(np.maxHp, np.hp + o.heal);
+          if (np.isLocal) {
+            this.floaters.push({ x: np.x, y: np.y - 30, text: `+${o.heal}`, color: "#5ee87a", life: 0.9 });
+            this.audio.sfx("pickup");
+          }
+          this.orbs.splice(i, 1);
+        } else if (o.t > 20) this.orbs.splice(i, 1);
+      }
+
+      // уровни игроков
+      for (const p of this.players) {
+        if (p.xp < p.xpNext) continue;
+        p.xp -= p.xpNext;
+        p.level++;
+        p.xpNext = Math.floor(XP_BASE * Math.pow(p.level, 1.32));
+        p.dmgMul *= 1.22;
+        p.maxHp += 15;
+        p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.35);
+        this.spawnParticles(p.x, p.y, 40, "#ffd24a", 320);
+        this.spawnWave(p.x, p.y, 200, "#ffd24a", 0, 18, 0.5);
+        this.addLight(p.x, p.y, 300, 0.4);
+        if (p.isLocal) {
+          this.announce(`УРОВЕНЬ ${p.level}!`, "удары стали мощнее");
+          this.audio.sfx("win");
+        } else if (coop) {
+          this.net?.sendEv({ t: "ann", x: `${p.hero.name} — УРОВЕНЬ ${p.level}!`, s: "" });
+          this.net?.sendEv({ t: "castfx", h: p.hero.id, k: "lvl", x: p.x, y: p.y, dir: 0 });
+        }
+      }
+
+      // смерти игроков
+      for (const p of this.players) {
+        if (p.alive && p.hp <= 0) {
+          p.alive = false;
+          if (p.isLocal) { this.announce("ВЫ ПАЛИ", this.players.some((q) => q.alive) ? "команда сражается дальше" : ""); this.audio.sfx("lose"); }
+          else this.net?.sendEv({ t: "ann", x: `${p.hero.name} ПАЛ`, s: "" });
+        }
+      }
+      if (this.players.length > 0 && this.players.every((p) => !p.alive)) { this.gameOver(); return; }
+
+      // рассылка состояния клиентам
+      if (coop) {
+        this.netSendT -= dt;
+        if (this.netSendT <= 0) { this.netSendT = 0.1; this.sendSnap(); }
+      }
+    } else {
+      // клиент: интерполяция мира из снапшотов + отправка своего ввода
+      this.updateClientEntities(dt);
+      this.netSendT -= dt;
+      if (this.netSendT <= 0 && this.net && this.hostPeerId) {
+        this.netSendT = 0.066;
+        this.net.sendInp({ x: Math.round(this.px), y: Math.round(this.py), fx: +this.facing.toFixed(2), wk: +this.walkPhase.toFixed(2), mv: this.me.moving }, this.hostPeerId);
+      }
+    }
+
+    this.updateFx(dt);
+
+    this.shake *= Math.pow(0.001, dt);
+    if (this.netMode === "off" && this.hp <= 0) this.gameOver();
+  }
+
+  /** Движение локального игрока: инерция, дэш, границы мира. */
+  private updateLocalMovement(dt: number): void {
     let sp = this.hero.speed * (this.speedBuffT > 0 ? 1.25 : 1);
     let moving = false;
     if (this.dashT > 0) {
       this.dashT -= dt;
       moving = true;
-      this.trail.push({ x: this.px, y: this.py, life: 0.35 });
-      if (this.trail.length > 40) this.trail.shift();
+      this.me.trail.push({ x: this.px, y: this.py, life: 0.35 });
+      if (this.me.trail.length > 40) this.me.trail.shift();
       const dsp = this.hero.id === "maxim" ? 1050 : this.hero.id === "nikita" ? 900 : 820;
       this.px += this.dashDx * dsp * dt;
       this.py += this.dashDy * dsp * dt;
       this.pvx = this.dashDx * dsp; this.pvy = this.dashDy * dsp;
-      if (this.dashDmgMul > 0) {
+      if (this.dashDmgMul > 0 && this.netMode !== "client") {
         for (const e of this.enemies) {
           if (this.dashHits.has(e)) continue;
           const d = Math.hypot(e.x - this.px, e.y - this.py);
           if (d < e.radius + 30) {
             this.dashHits.add(e);
-            this.damageEnemy(e, this.basicDmg() * this.dashDmgMul, this.dashDx * 320, this.dashDy * 320);
+            this.damageEnemy(e, this.basicDmg(this.me) * this.dashDmgMul, this.dashDx * 320, this.dashDy * 320, this.me);
           }
         }
       }
@@ -409,213 +809,225 @@ export class Arpg {
       moving = want || Math.hypot(this.pvx, this.pvy) > 14;
     }
     if (moving) this.walkPhase += dt * (this.dashT > 0 ? 2.2 : 1);
+    this.me.moving = moving;
     this.px = Math.max(40, Math.min(WORLD_SIZE - 40, this.px));
     this.py = Math.max(40, Math.min(WORLD_SIZE - 40, this.py));
-
-    // атаки
-    if (this.mouseDown && this.cdBasic <= 0 && this.dashT <= 0) this.basicAttack();
-    if (this.input.consumeAction("KeyQ") && this.cdQ <= 0) this.castQ();
-    if (this.input.consumeAction("KeyE") && this.cdE <= 0) this.castE();
-    if (this.input.consumeAction("KeyR") && this.cdR <= 0) this.castR();
-    if ((this.input.consumeAction("KeyT") || this.input.consumeAction("KeyF")) && this.cdT <= 0) this.castSatoru();
-
-    // спавн
-    const cap = Math.min(70, 6 + this.wave * 3);
-    this.spawnT -= dt;
-    if (this.spawnT <= 0 && this.enemies.length < cap) {
-      this.spawnT = Math.max(0.7, 1.8 - this.wave * 0.08);
-      const batch = Math.min(cap - this.enemies.length, 2 + Math.floor(this.wave / 2));
-      for (let i = 0; i < batch; i++) this.spawnEnemy(false);
-    }
-    if (this.time >= this.nextBossAt) {
-      this.nextBossAt += BOSS_PERIOD;
-      this.spawnEnemy(true);
-      this.announce(`БОСС: ${this.map.bossName}`, "постарайся выжить!");
-      this.audio.sfx("lose");
-    }
-
-    this.updateEnemies(dt);
-    this.updateProjs(dt);
-    this.updateSatoru(dt);
-    this.updateFx(dt);
-
-    // сферы здоровья
-    for (let i = this.orbs.length - 1; i >= 0; i--) {
-      const o = this.orbs[i];
-      o.t += dt;
-      const d = Math.hypot(o.x - this.px, o.y - this.py);
-      if (d < 110) { o.x += (this.px - o.x) / d * 300 * dt; o.y += (this.py - o.y) / d * 300 * dt; }
-      if (d < 26) {
-        this.hp = Math.min(this.maxHp, this.hp + o.heal);
-        this.floaters.push({ x: this.px, y: this.py - 30, text: `+${o.heal}`, color: "#5ee87a", life: 0.9 });
-        this.audio.sfx("pickup");
-        this.orbs.splice(i, 1);
-      } else if (o.t > 20) this.orbs.splice(i, 1);
-    }
-
-    // уровень
-    if (this.xp >= this.xpNext) {
-      this.xp -= this.xpNext;
-      this.level++;
-      this.xpNext = Math.floor(XP_BASE * Math.pow(this.level, 1.32));
-      this.dmgMul *= 1.22;
-      this.maxHp += 15;
-      this.hp = Math.min(this.maxHp, this.hp + this.maxHp * 0.35);
-      this.announce(`УРОВЕНЬ ${this.level}!`, "удары стали мощнее");
-      this.spawnParticles(this.px, this.py, 40, "#ffd24a", 320);
-      this.spawnWave(this.px, this.py, 200, "#ffd24a", 0, 18, 0.5);
-      this.addLight(this.px, this.py, 300, 0.4);
-      this.audio.sfx("win");
-    }
-
-    this.shake *= Math.pow(0.001, dt);
-    if (this.hp <= 0) this.gameOver();
   }
 
-  private basicDmg(): number {
-    const base = { nikita: 26, maxim: 16, dasha: 14, vika: 18 }[this.hero.id];
-    return base * this.dmgMul;
+  /** Локальная попытка каста: на клиенте уходит хосту, иначе исполняется сразу. */
+  private tryCast(k: "basic" | "q" | "e" | "r" | "t"): void {
+    if (this.netMode === "client") {
+      if (!this.net || !this.hostPeerId) return;
+      this.net.sendCast({ k, dir: this.facing }, this.hostPeerId);
+      this.swingT = 0.18; // мгновенный отклик анимации; урон посчитает хост
+      if (k === "basic") this.cdBasic = 0.25;
+      return;
+    }
+    this.executeCast(this.me, k, this.facing);
   }
 
-  // ---------- атаки и способности ----------
+  /** Выполнение способности игрока p (на хосте/в соло). */
+  private executeCast(p: PlayerEnt, k: string, dir: number): void {
+    const before = { q: p.cdQ, e: p.cdE, r: p.cdR, t: p.cdT };
+    if (k === "basic") this.basicAttack(p, dir);
+    else if (k === "q") this.castQ(p, dir);
+    else if (k === "e") this.castE(p, dir);
+    else if (k === "r") this.castR(p, dir);
+    else if (k === "t") this.castSatoru(p);
+    // визуал для остальных клиентов
+    if (this.netMode === "host" && k !== "basic") {
+      const fired = (k === "q" && p.cdQ !== before.q) || (k === "e" && p.cdE !== before.e)
+        || (k === "r" && p.cdR !== before.r) || (k === "t" && p.cdT !== before.t);
+      if (fired) this.net?.sendEv({ t: "castfx", h: p.hero.id, k, x: p.x, y: p.y, dir });
+    }
+  }
 
-  private basicAttack(): void {
-    const dir = this.facing;
-    if (this.hero.id === "nikita") {
-      this.cdBasic = 0.42;
-      this.swingT = 0.18;
+  /** Экран выбора героя: соло, создание лобби, вход по коду. */
+  private updateSelect(): void {
+    if (this.selScreen === "join") {
+      for (let i = 0; i < 26; i++) {
+        const code = `Key${String.fromCharCode(65 + i)}`;
+        if (this.input.consumeAction(code) && this.joinCode.length < 5) { this.joinCode += String.fromCharCode(65 + i); this.audio.sfx("ui"); }
+      }
+      for (let i = 0; i <= 9; i++) {
+        if (this.input.consumeAction(`Digit${i}`) && this.joinCode.length < 5) { this.joinCode += String(i); this.audio.sfx("ui"); }
+      }
+      if (this.input.consumeAction("Backspace")) { this.joinCode = this.joinCode.slice(0, -1); this.audio.sfx("ui"); }
+      if (this.input.consumeAction("Escape")) { this.selScreen = "heroes"; this.lobbyError = ""; this.audio.sfx("ui"); }
+      if ((this.input.consumeAction("Enter") || this.input.consumeAction("NumpadEnter")) && this.joinCode.length === 5) {
+        this.joinLobby(this.joinCode);
+      }
+      return;
+    }
+    for (let i = 0; i < HEROES.length; i++) {
+      if (this.input.consumeAction(`Digit${i + 1}`)) { this.selIndex = i; this.audio.sfx("ui"); }
+    }
+    if (this.input.consumeAction("Space") || this.input.consumeAction("Enter")) {
+      this.audio.sfx("ui");
+      this.netMode = "off";
+      this.startRun(HEROES[this.selIndex]);
+    }
+    if (this.input.consumeAction("KeyC")) { this.createLobby(); }
+    if (this.input.consumeAction("KeyJ")) { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; this.audio.sfx("ui"); }
+  }
+
+  private basicDmg(p: PlayerEnt): number {
+    const base = { nikita: 26, maxim: 16, dasha: 14, vika: 18 }[p.hero.id];
+    return base * p.dmgMul;
+  }
+
+  /** Ближайший живой игрок к точке (цель для врагов и сфер). */
+  private nearestPlayer(x: number, y: number): PlayerEnt | null {
+    let best: PlayerEnt | null = null;
+    let bd = Infinity;
+    for (const p of this.players) {
+      if (!p.alive) continue;
+      const d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y);
+      if (d < bd) { bd = d; best = p; }
+    }
+    return best;
+  }
+
+  private basicAttack(p: PlayerEnt, dir: number): void {
+    if (p.hero.id === "nikita") {
+      p.cdBasic = 0.42;
+      p.swingT = 0.18;
       let hit = false;
       for (const e of this.enemies) {
-        const d = Math.hypot(e.x - this.px, e.y - this.py);
-        const ang = Math.atan2(e.y - this.py, e.x - this.px);
+        const d = Math.hypot(e.x - p.x, e.y - p.y);
+        const ang = Math.atan2(e.y - p.y, e.x - p.x);
         let diff = ang - dir;
         while (diff > Math.PI) diff -= 2 * Math.PI;
         while (diff < -Math.PI) diff += 2 * Math.PI;
         if (d < 95 + e.radius && Math.abs(diff) < 0.95) {
-          this.damageEnemy(e, this.basicDmg(), Math.cos(ang) * 220, Math.sin(ang) * 220);
+          this.damageEnemy(e, this.basicDmg(p), Math.cos(ang) * 220, Math.sin(ang) * 220, p);
           hit = true;
         }
       }
-      this.audio.sfx(hit ? "hit" : "move");
+      if (p.isLocal) this.audio.sfx(hit ? "hit" : "move");
     } else {
       const spec = {
         maxim: { sp: 720, r: 7, cd: 0.32, color: "#d8e2e8", kind: "shuriken" },
         dasha: { sp: 950, r: 4, cd: 0.2, color: "#ffd24a", kind: "bullet" },
         vika: { sp: 660, r: 8, cd: 0.38, color: "#b58cff", kind: "bolt" },
-      }[this.hero.id];
-      this.cdBasic = spec.cd;
-      this.swingT = 0.15; // взмах рукой при броске/выстреле/касте
+      }[p.hero.id];
+      p.cdBasic = spec.cd;
+      p.swingT = 0.15; // взмах рукой при броске/выстреле/касте
       this.projs.push({
-        x: this.px + Math.cos(dir) * 26, y: this.py + Math.sin(dir) * 26,
+        x: p.x + Math.cos(dir) * 26, y: p.y + Math.sin(dir) * 26,
         vx: Math.cos(dir) * spec.sp, vy: Math.sin(dir) * spec.sp,
-        dmg: this.basicDmg(), r: spec.r, friendly: true, pierce: false,
-        life: 0.9, color: spec.color, kind: spec.kind, disarm: false, hitSet: null,
+        dmg: this.basicDmg(p), r: spec.r, friendly: true, pierce: false,
+        life: 0.9, color: spec.color, kind: spec.kind, disarm: false, hitSet: null, owner: p,
       });
-      this.audio.sfx("move");
+      if (p.isLocal) this.audio.sfx("move");
     }
   }
 
-  private castQ(): void {
-    if (this.mana < 30) {
-      this.floaters.push({ x: this.px, y: this.py - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+  private castQ(p: PlayerEnt, dir: number): void {
+    if (p.mana < 30) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
       return;
     }
-    this.mana -= 30;
-    const dir = this.facing;
-    if (this.hero.id === "nikita") {
-      this.cdQ = this.hero.q.cooldown;
+    p.mana -= 30;
+    if (p.hero.id === "nikita") {
+      p.cdQ = p.hero.q.cooldown;
       this.projs.push({
-        x: this.px + Math.cos(dir) * 30, y: this.py + Math.sin(dir) * 30,
+        x: p.x + Math.cos(dir) * 30, y: p.y + Math.sin(dir) * 30,
         vx: Math.cos(dir) * 1050, vy: Math.sin(dir) * 1050,
-        dmg: this.basicDmg() * 3, r: 9, friendly: true, pierce: true,
-        life: 1.1, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(),
+        dmg: this.basicDmg(p) * 3, r: 9, friendly: true, pierce: true,
+        life: 1.1, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(), owner: p,
       });
       this.shake = Math.min(14, this.shake + 6);
       this.audio.sfx("explosion");
-    } else if (this.hero.id === "maxim") {
-      this.cdQ = this.hero.q.cooldown;
-      this.swingT = 0.25;
+    } else if (p.hero.id === "maxim") {
+      p.cdQ = p.hero.q.cooldown;
+      p.swingT = 0.25;
       for (const e of this.enemies) {
-        const d = Math.hypot(e.x - this.px, e.y - this.py);
+        const d = Math.hypot(e.x - p.x, e.y - p.y);
         if (d < 150 + e.radius) {
-          const ang = Math.atan2(e.y - this.py, e.x - this.px);
-          this.damageEnemy(e, this.basicDmg() * 2.6, Math.cos(ang) * 380, Math.sin(ang) * 380);
+          const ang = Math.atan2(e.y - p.y, e.x - p.x);
+          this.damageEnemy(e, this.basicDmg(p) * 2.6, Math.cos(ang) * 380, Math.sin(ang) * 380, p);
         }
       }
-      this.spawnParticles(this.px, this.py, 36, "#7ec8ff", 380);
-      this.spawnParticles(this.px, this.py, 16, "#ffffff", 260);
-      this.spawnWave(this.px, this.py, 190, "#7ec8ff", 0, 20, 0.4);
-      this.addLight(this.px, this.py, 260, 0.25);
+      this.spawnParticles(p.x, p.y, 36, "#7ec8ff", 380);
+      this.spawnParticles(p.x, p.y, 16, "#ffffff", 260);
+      this.spawnWave(p.x, p.y, 190, "#7ec8ff", 0, 20, 0.4);
+      this.addLight(p.x, p.y, 260, 0.25);
       this.shake = Math.min(14, this.shake + 8);
       this.audio.sfx("explosion");
-    } else if (this.hero.id === "dasha") {
-      this.cdQ = this.hero.q.cooldown;
+    } else if (p.hero.id === "dasha") {
+      p.cdQ = p.hero.q.cooldown;
       for (let i = -2; i <= 2; i++) {
         const a = dir + i * 0.22;
         this.projs.push({
-          x: this.px + Math.cos(a) * 26, y: this.py + Math.sin(a) * 26,
+          x: p.x + Math.cos(a) * 26, y: p.y + Math.sin(a) * 26,
           vx: Math.cos(a) * 880, vy: Math.sin(a) * 880,
-          dmg: this.basicDmg() * 0.9, r: 4, friendly: true, pierce: false,
-          life: 0.7, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null,
+          dmg: this.basicDmg(p) * 0.9, r: 4, friendly: true, pierce: false,
+          life: 0.7, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null, owner: p,
         });
       }
       this.audio.sfx("hit");
     } else {
-      this.cdQ = this.hero.q.cooldown;
+      p.cdQ = p.hero.q.cooldown;
       this.projs.push({
-        x: this.px + Math.cos(dir) * 26, y: this.py + Math.sin(dir) * 26,
+        x: p.x + Math.cos(dir) * 26, y: p.y + Math.sin(dir) * 26,
         vx: Math.cos(dir) * 820, vy: Math.sin(dir) * 820,
-        dmg: this.basicDmg() * 2, r: 14, friendly: true, pierce: true,
-        life: 0.9, color: "#ff5252", kind: "expelliarmus", disarm: true, hitSet: new Set(),
+        dmg: this.basicDmg(p) * 2, r: 14, friendly: true, pierce: true,
+        life: 0.9, color: "#ff5252", kind: "expelliarmus", disarm: true, hitSet: new Set(), owner: p,
       });
       this.audio.sfx("ui");
     }
   }
 
-  private castE(): void {
-    if (this.mana < 25) {
-      this.floaters.push({ x: this.px, y: this.py - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+  private castE(p: PlayerEnt, dir: number): void {
+    if (p.mana < 25) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
       return;
     }
-    this.mana -= 25;
-    if (this.hero.id === "nikita") {
-      this.cdE = this.hero.e.cooldown;
-      this.dashT = 0.24; this.dashDx = Math.cos(this.facing); this.dashDy = Math.sin(this.facing);
-      this.dashDmgMul = 1.6; this.dashHits = new Set();
+    p.mana -= 25;
+    if (p.hero.id === "nikita") {
+      p.cdE = p.hero.e.cooldown;
+      p.dashT = 0.24; p.dashDx = Math.cos(dir); p.dashDy = Math.sin(dir);
+      p.dashDmgMul = 1.6; p.dashHits = new Set();
       this.audio.sfx("hit");
-    } else if (this.hero.id === "maxim") {
-      this.cdE = this.hero.e.cooldown;
-      this.dashT = 0.28; this.dashDx = Math.cos(this.facing); this.dashDy = Math.sin(this.facing);
-      this.dashDmgMul = 2.2; this.dashHits = new Set();
+    } else if (p.hero.id === "maxim") {
+      p.cdE = p.hero.e.cooldown;
+      p.dashT = 0.28; p.dashDx = Math.cos(dir); p.dashDy = Math.sin(dir);
+      p.dashDmgMul = 2.2; p.dashHits = new Set();
       this.audio.sfx("explosion");
-    } else if (this.hero.id === "dasha") {
-      this.cdE = this.hero.e.cooldown;
-      const ix = this.input.moveX, iz = this.input.moveZ;
+    } else if (p.hero.id === "dasha") {
+      p.cdE = p.hero.e.cooldown;
+      const ix = p.isLocal ? this.input.moveX : 0, iz = p.isLocal ? this.input.moveZ : 0;
       const has = Math.abs(ix) + Math.abs(iz) > 0;
-      const dx = has ? ix / (Math.hypot(ix, iz) || 1) : Math.cos(this.facing);
-      const dy = has ? -iz / (Math.hypot(ix, iz) || 1) : Math.sin(this.facing);
-      this.dashT = 0.25; this.dashDx = dx; this.dashDy = dy; this.dashDmgMul = 0;
-      this.iframes = 0.6; this.speedBuffT = 2;
+      const dx = has ? ix / (Math.hypot(ix, iz) || 1) : Math.cos(dir);
+      const dy = has ? -iz / (Math.hypot(ix, iz) || 1) : Math.sin(dir);
+      p.dashT = 0.25; p.dashDx = dx; p.dashDy = dy; p.dashDmgMul = 0;
+      p.iframes = 0.6; p.speedBuffT = 2;
       this.audio.sfx("ui");
     } else {
-      this.cdE = this.hero.e.cooldown;
-      this.shieldT = 3;
-      this.spawnParticles(this.px, this.py, 20, "#b58cff", 180);
+      p.cdE = p.hero.e.cooldown;
+      p.shieldT = 3;
+      this.spawnParticles(p.x, p.y, 20, "#b58cff", 180);
       this.audio.sfx("win");
     }
   }
 
-  private castSatoru(): void {
-    this.cdT = this.hero.ult.cooldown;
-    this.satoru = { x: this.px - 60, y: this.py - 60, life: SATORU_DURATION, swipeCd: 0 };
-    this.announce("САТОРУ В ДЕЛЕ!", "кот пришёл на помощь");
-    this.spawnParticles(this.px, this.py - 40, 24, "#e8e8e8", 240);
+  private castSatoru(p: PlayerEnt): void {
+    p.cdT = p.hero.ult.cooldown;
+    this.satorus = this.satorus.filter((s) => s.pid !== p.pid);
+    this.satorus.push({ x: p.x - 60, y: p.y - 60, life: SATORU_DURATION, swipeCd: 0, pid: p.pid });
+    if (p.isLocal) {
+      this.announce("САТОРУ В ДЕЛЕ!", "кот пришёл на помощь");
+    } else if (this.netMode === "host") {
+      this.net?.sendEv({ t: "ann", x: "САТОРУ В ДЕЛЕ!", s: `кот ${p.hero.name} пришёл на помощь` });
+    }
+    this.spawnParticles(p.x, p.y - 40, 24, "#e8e8e8", 240);
     this.audio.sfx("win");
   }
 
   /** Ударная волна: зрелищное кольцо; при dmg > 0 бьёт каждого врага один раз. */
-  private spawnWave(x: number, y: number, maxR: number, color: string, dmg = 0, width = 26, dur = 0.45): void {
-    this.waves.push({ x, y, r: 10, maxR, life: dur, maxLife: dur, color, dmg, width, hitSet: dmg > 0 ? new Set() : null });
+  private spawnWave(x: number, y: number, maxR: number, color: string, dmg = 0, width = 26, dur = 0.45, owner?: PlayerEnt): void {
+    this.waves.push({ x, y, r: 10, maxR, life: dur, maxLife: dur, color, dmg, width, hitSet: dmg > 0 ? new Set() : null, owner });
   }
 
   /** Вспышка света на слое освещения (взрывы, заклинания). */
@@ -624,50 +1036,49 @@ export class Arpg {
   }
 
   /** Массовый ультимейт (клавиша R) — у каждого героя свой. */
-  private castR(): void {
-    if (this.mana < 60) {
-      this.floaters.push({ x: this.px, y: this.py - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+  private castR(p: PlayerEnt, dir: number): void {
+    if (p.mana < 60) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
       return;
     }
-    this.mana -= 60;
-    this.cdR = this.hero.r.cooldown;
-    this.swingT = 0.3;
-    const dir = this.facing;
-    if (this.hero.id === "nikita") {
+    p.mana -= 60;
+    p.cdR = p.hero.r.cooldown;
+    p.swingT = 0.3;
+    if (p.hero.id === "nikita") {
       // «Шайбоград»: 14 взрывных шайб во все стороны
       for (let k = 0; k < 14; k++) {
         const a = (k / 14) * Math.PI * 2 + 0.13;
         this.projs.push({
-          x: this.px + Math.cos(a) * 34, y: this.py + Math.sin(a) * 34,
+          x: p.x + Math.cos(a) * 34, y: p.y + Math.sin(a) * 34,
           vx: Math.cos(a) * 950, vy: Math.sin(a) * 950,
-          dmg: this.basicDmg() * 2.2, r: 9, friendly: true, pierce: true,
-          life: 1.0, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(),
+          dmg: this.basicDmg(p) * 2.2, r: 9, friendly: true, pierce: true,
+          life: 1.0, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(), owner: p,
         });
       }
-      this.spawnWave(this.px, this.py, 240, "#7ec8ff", 0, 22, 0.5);
-      this.addLight(this.px, this.py, 320, 0.3);
+      this.spawnWave(p.x, p.y, 240, "#7ec8ff", 0, 22, 0.5);
+      this.addLight(p.x, p.y, 320, 0.3);
       this.shake = Math.min(18, this.shake + 10);
       this.audio.sfx("explosion");
-    } else if (this.hero.id === "maxim") {
+    } else if (p.hero.id === "maxim") {
       // «Расен-сюрикен»: гигантская сфера летит в точку прицела и взрывается
       this.projs.push({
-        x: this.px + Math.cos(dir) * 40, y: this.py + Math.sin(dir) * 40,
+        x: p.x + Math.cos(dir) * 40, y: p.y + Math.sin(dir) * 40,
         vx: Math.cos(dir) * 780, vy: Math.sin(dir) * 780,
-        dmg: this.basicDmg() * 1.4, r: 26, friendly: true, pierce: true,
-        life: 0.85, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(),
+        dmg: this.basicDmg(p) * 1.4, r: 26, friendly: true, pierce: true,
+        life: 0.85, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(), owner: p,
       });
       this.audio.sfx("explosion");
-    } else if (this.hero.id === "dasha") {
+    } else if (p.hero.id === "dasha") {
       // «Тотальный отстрел»: три круговых залпа по 16 пуль
-      this.volleys.push({ t: 0, ang0: 0 }, { t: 0.16, ang0: Math.PI / 16 }, { t: 0.32, ang0: -Math.PI / 16 });
-      this.addLight(this.px, this.py, 260, 0.2);
+      this.volleys.push({ t: 0, ang0: 0, p }, { t: 0.16, ang0: Math.PI / 16, p }, { t: 0.32, ang0: -Math.PI / 16, p });
+      this.addLight(p.x, p.y, 260, 0.2);
       this.audio.sfx("hit");
     } else {
       // «Волна Авады»: зелёная волна смерти, бьёт всех по пути
-      this.spawnWave(this.px, this.py, 430, "#3ddc84", this.basicDmg() * 4.5, 36, 0.7);
-      this.spawnWave(this.px, this.py, 300, "#b0ffd0", 0, 18, 0.55);
-      this.spawnParticles(this.px, this.py, 40, "#3ddc84", 380);
-      this.addLight(this.px, this.py, 430, 0.5);
+      this.spawnWave(p.x, p.y, 430, "#3ddc84", this.basicDmg(p) * 4.5, 36, 0.7, p);
+      this.spawnWave(p.x, p.y, 300, "#b0ffd0", 0, 18, 0.55);
+      this.spawnParticles(p.x, p.y, 40, "#3ddc84", 380);
+      this.addLight(p.x, p.y, 430, 0.5);
       this.shake = Math.min(20, this.shake + 12);
       this.audio.sfx("explosion");
     }
@@ -676,20 +1087,33 @@ export class Arpg {
   // ---------- враги ----------
 
   private spawnEnemy(boss: boolean): void {
+    const anchor = this.players.filter((p) => p.alive)[Math.floor(Math.random() * Math.max(1, this.players.filter((p) => p.alive).length))] ?? this.me;
     const ang = Math.random() * Math.PI * 2;
     const dist = boss ? 600 : 560 + Math.random() * 320;
-    const x = Math.max(60, Math.min(WORLD_SIZE - 60, this.px + Math.cos(ang) * dist));
-    const y = Math.max(60, Math.min(WORLD_SIZE - 60, this.py + Math.sin(ang) * dist));
-    const kind = this.map.enemies[Math.floor(Math.random() * this.map.enemies.length)];
+    const x = Math.max(60, Math.min(WORLD_SIZE - 60, anchor.x + Math.cos(ang) * dist));
+    const y = Math.max(60, Math.min(WORLD_SIZE - 60, anchor.y + Math.sin(ang) * dist));
+    const pool = this.netMode !== "off" ? ALL_ENEMY_KINDS : this.map.enemies;
+    const kind = pool[Math.floor(Math.random() * pool.length)];
     if (boss) {
       this.bossAlive = true;
+      let name = this.map.bossName;
+      let color = this.map.bossColor;
+      let sprite = this.enemySpriteId();
+      if (this.netMode !== "off") {
+        // кооп: боссы со всех карт выходят по очереди
+        const cb = COOP_BOSSES[Math.floor(this.time / BOSS_PERIOD) % COOP_BOSSES.length];
+        name = cb.name; color = cb.color; sprite = cb.sprite;
+      }
       this.enemies.push({
-        x, y, kind, boss: true, name: this.map.bossName,
+        x, y, kind, boss: true, name,
         hp: 420 * this.hpMul, maxHp: 420 * this.hpMul,
         speed: 72, dmg: 20 * this.dmgMulE, radius: 36, xp: 150,
         attackCd: 0, shootCd: 2, burstCd: 4, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: 0, sprite: this.enemySpriteId(), windup: 0,
+        anim: 0, sprite, windup: 0, nid: this.nidSeq++,
       });
+      this.announce(`БОСС: ${name}`, "постарайся выжить!");
+      if (this.netMode === "host") this.net?.sendEv({ t: "ann", x: `БОСС: ${name}`, s: "постарайтесь выжить!" });
+      void color;
     } else {
       this.enemies.push({
         x, y, kind, boss: false, name: kind.name,
@@ -697,7 +1121,7 @@ export class Arpg {
         speed: kind.speed * (1 + (this.wave - 1) * 0.02), dmg: kind.dmg * this.dmgMulE,
         radius: kind.radius, xp: kind.xp,
         attackCd: 0, shootCd: 1 + Math.random() * 1.5, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: Math.random() * 10, sprite: kind.spriteVar ?? this.enemySpriteId(), windup: 0,
+        anim: Math.random() * 10, sprite: this.netMode !== "off" ? kindSprite(kind) : (kind.spriteVar ?? this.enemySpriteId()), windup: 0, nid: this.nidSeq++,
       });
     }
   }
@@ -712,13 +1136,15 @@ export class Arpg {
       // нокбэк
       e.x += e.kx * dt; e.y += e.ky * dt;
       e.kx *= Math.pow(0.0001, dt); e.ky *= Math.pow(0.0001, dt);
-      const dx = this.px - e.x, dy = this.py - e.y;
+      const tgt = this.nearestPlayer(e.x, e.y);
+      if (!tgt) continue;
+      const dx = tgt.x - e.x, dy = tgt.y - e.y;
       const d = Math.hypot(dx, dy) || 1;
       const slow = e.disarmT > 0 ? 0.5 : 1;
       if (e.windup > 0) {
         // замах: враг замирает, затем бьёт, если цель ещё рядом
         e.windup -= dt;
-        if (e.windup <= 0 && d < e.radius + 36) this.hurtPlayer(e.dmg);
+        if (e.windup <= 0 && d < e.radius + 36) this.hurtPlayer(tgt, e.dmg);
       } else if (e.disarmT <= 0) {
         if (e.kind.ranged && !e.boss) {
           if (d > 320) { e.x += (dx / d) * e.speed * slow * dt; e.y += (dy / d) * e.speed * slow * dt; }
@@ -773,40 +1199,46 @@ export class Arpg {
     }
   }
 
-  private hurtPlayer(dmg: number): void {
-    if (this.iframes > 0) {
-      this.floaters.push({ x: this.px, y: this.py - 30, text: "УВЕРНУЛСЯ", color: "#9fd8ff", life: 0.7 });
+  private hurtPlayer(p: PlayerEnt, dmg: number): void {
+    if (p.iframes > 0) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 30, text: "УВЕРНУЛСЯ", color: "#9fd8ff", life: 0.7 });
       return;
     }
-    if (this.shieldT > 0) {
-      this.floaters.push({ x: this.px, y: this.py - 30, text: "ПРОТЕГО!", color: "#b58cff", life: 0.7 });
-      this.audio.sfx("ui");
+    if (p.shieldT > 0) {
+      if (p.isLocal) {
+        this.floaters.push({ x: p.x, y: p.y - 30, text: "ПРОТЕГО!", color: "#b58cff", life: 0.7 });
+        this.audio.sfx("ui");
+      }
       return;
     }
-    this.hp -= dmg;
-    this.hurtFlash = 0.25;
-    this.decals.push({ x: this.px + (Math.random() - 0.5) * 20, y: this.py + 14, r: 7 + Math.random() * 6, color: "#6e1010", alpha: 0.45 });
+    p.hp -= dmg;
+    p.hurtFlash = 0.25;
+    this.decals.push({ x: p.x + (Math.random() - 0.5) * 20, y: p.y + 14, r: 7 + Math.random() * 6, color: "#6e1010", alpha: 0.45 });
     if (this.decals.length > 250) this.decals.shift();
-    this.shake = Math.min(16, this.shake + 5);
-    this.spawnParticles(this.px, this.py, 8, "#e84a4a", 200);
-    this.audio.sfx("hit");
+    if (p.isLocal) {
+      this.shake = Math.min(16, this.shake + 5);
+      this.audio.sfx("hit");
+    }
+    this.spawnParticles(p.x, p.y, 8, "#e84a4a", 200);
   }
 
-  private damageEnemy(e: Enemy, dmg: number, kx = 0, ky = 0): void {
+  private damageEnemy(e: Enemy, dmg: number, kx = 0, ky = 0, owner?: PlayerEnt): void {
     e.hp -= dmg;
     e.flash = 0.12;
     e.kx += kx; e.ky += ky;
     if (this.floaters.length < 24) // текст в программном рендере дорогой — ограничиваем
       this.floaters.push({ x: e.x, y: e.y - e.radius - 8, text: String(Math.round(dmg)), color: "#ffe28a", life: 0.7 });
     this.spawnParticles(e.x, e.y, 4, e.kind.accent, 160);
-    if (e.hp <= 0) this.killEnemy(e);
+    if (e.hp <= 0) this.killEnemy(e, owner);
   }
 
-  private killEnemy(e: Enemy): void {
+  private killEnemy(e: Enemy, owner?: PlayerEnt): void {
     const idx = this.enemies.indexOf(e);
     if (idx >= 0) this.enemies.splice(idx, 1);
+    if (e.nid !== undefined) this.enemyByNid.delete(e.nid);
     this.kills++;
-    this.xp += e.xp;
+    const killer = owner ?? this.me;
+    killer.xp += e.xp;
     // хит-стоп: игра на мгновение замирает — убийство чувствуется весомым
     this.hitStop = Math.max(this.hitStop, e.boss ? 0.1 : 0.03);
     // труп падает и растворяется
@@ -822,6 +1254,7 @@ export class Arpg {
     this.spawnParticles(e.x, e.y, e.boss ? 40 : 14, e.kind.accent, e.boss ? 380 : 240);
     if (e.boss) {
       this.announce(`${e.name} ПОВЕРЖЕН!`, "+150 XP и сферы здоровья");
+      if (this.netMode === "host") this.net?.sendEv({ t: "ann", x: `${e.name} ПОВЕРЖЕН!`, s: "+150 XP и сферы здоровья" });
       for (let k = 0; k < 3; k++) this.orbs.push({ x: e.x + (k - 1) * 40, y: e.y + 30, heal: 25, t: 0 });
       this.spawnWave(e.x, e.y, 260, "#ffd24a", 0, 22, 0.6);
       this.addLight(e.x, e.y, 360, 0.5);
@@ -844,66 +1277,74 @@ export class Arpg {
           if (Math.hypot(e.x - p.x, e.y - p.y) < e.radius + p.r) {
             if (p.disarm) e.disarmT = 3;
             const ang = Math.atan2(p.vy, p.vx);
-            this.damageEnemy(e, p.dmg, Math.cos(ang) * 140, Math.sin(ang) * 140);
+            this.damageEnemy(e, p.dmg, Math.cos(ang) * 140, Math.sin(ang) * 140, p.owner);
             if (p.pierce) p.hitSet?.add(e);
             else { dead = true; break; }
           }
         }
       } else if (!dead && !p.friendly) {
-        if (Math.hypot(this.px - p.x, this.py - p.y) < 22 + p.r) {
-          this.hurtPlayer(p.dmg);
-          dead = true;
+        for (const pl of this.players) {
+          if (!pl.alive) continue;
+          if (Math.hypot(pl.x - p.x, pl.y - p.y) < 22 + p.r) {
+            this.hurtPlayer(pl, p.dmg);
+            dead = true;
+            break;
+          }
         }
       }
       if (dead) {
         if (p.kind === "rasenshuriken") {
           // взрыв Расен-сюрикена: огромная волна чакры
-          this.spawnWave(p.x, p.y, 330, "#7ec8ff", this.basicDmg() * 5, 34, 0.55);
+          this.spawnWave(p.x, p.y, 330, "#7ec8ff", this.basicDmg(p.owner ?? this.me) * 5, 34, 0.55, p.owner);
           this.spawnWave(p.x, p.y, 210, "#ffffff", 0, 16, 0.4);
           this.spawnParticles(p.x, p.y, 36, "#7ec8ff", 420);
           this.spawnParticles(p.x, p.y, 14, "#ffffff", 300);
           this.addLight(p.x, p.y, 400, 0.4);
           this.shake = Math.min(20, this.shake + 12);
           this.audio.sfx("explosion");
+          if (this.netMode === "host") this.net?.sendEv({ t: "boom", x: p.x, y: p.y });
         } else if (p.kind !== "bullet") this.spawnParticles(p.x, p.y, 3, p.color, 120);
+        if (p.nid !== undefined) this.projByNid.delete(p.nid);
         this.projs.splice(i, 1);
       }
     }
   }
 
   private updateSatoru(dt: number): void {
-    const s = this.satoru;
-    if (!s) return;
-    s.life -= dt; s.swipeCd -= dt;
-    if (s.life <= 0) {
-      this.spawnParticles(s.x, s.y, 20, "#e8e8e8", 220);
-      this.satoru = null;
-      return;
-    }
-    let target: Enemy | null = null;
-    let best = 950;
-    for (const e of this.enemies) {
-      const d = Math.hypot(e.x - s.x, e.y - s.y);
-      if (d < best) { best = d; target = e; }
-    }
-    if (target) {
-      const d = best || 1;
-      if (d > 64) { s.x += ((target.x - s.x) / d) * 430 * dt; s.y += ((target.y - s.y) / d) * 430 * dt; }
-      else if (s.swipeCd <= 0) {
-        s.swipeCd = 0.55;
-        for (const e of this.enemies) {
-          if (Math.hypot(e.x - s.x, e.y - s.y) < 78 + e.radius) {
-            const ang = Math.atan2(e.y - s.y, e.x - s.x);
-            this.damageEnemy(e, this.basicDmg() * 1.6, Math.cos(ang) * 260, Math.sin(ang) * 260);
-          }
-        }
-        this.floaters.push({ x: s.x, y: s.y - 30, text: "МРРР!", color: "#ffffff", life: 0.6 });
-        this.spawnParticles(s.x, s.y, 10, "#f0f0f0", 240);
-        this.audio.sfx("hit");
+    for (let si = this.satorus.length - 1; si >= 0; si--) {
+      const s = this.satorus[si];
+      s.life -= dt; s.swipeCd -= dt;
+      if (s.life <= 0) {
+        this.spawnParticles(s.x, s.y, 20, "#e8e8e8", 220);
+        this.satorus.splice(si, 1);
+        continue;
       }
-    } else {
-      const d = Math.hypot(this.px - s.x, this.py - s.y) || 1;
-      if (d > 90) { s.x += ((this.px - s.x) / d) * 380 * dt; s.y += ((this.py - s.y) / d) * 380 * dt; }
+      const owner = this.players.find((p) => p.pid === s.pid) ?? this.me;
+      let target: Enemy | null = null;
+      let best = 950;
+      for (const e of this.enemies) {
+        const d = Math.hypot(e.x - s.x, e.y - s.y);
+        if (d < best) { best = d; target = e; }
+      }
+      if (target) {
+        const d = best || 1;
+        if (d > 64) { s.x += ((target.x - s.x) / d) * 430 * dt; s.y += ((target.y - s.y) / d) * 430 * dt; }
+        else if (s.swipeCd <= 0) {
+          s.swipeCd = 0.55;
+          for (const e of this.enemies) {
+            if (Math.hypot(e.x - s.x, e.y - s.y) < 78 + e.radius) {
+              const ang = Math.atan2(e.y - s.y, e.x - s.x);
+              this.damageEnemy(e, this.basicDmg(owner) * 1.6, Math.cos(ang) * 260, Math.sin(ang) * 260, owner);
+            }
+          }
+          this.floaters.push({ x: s.x, y: s.y - 30, text: "МРРР!", color: "#ffffff", life: 0.6 });
+          this.spawnParticles(s.x, s.y, 10, "#f0f0f0", 240);
+          this.audio.sfx("hit");
+        }
+      } else {
+        const d = Math.hypot(owner.x - s.x, owner.y - s.y) || 1;
+        if (d > 90) { s.x += ((owner.x - s.x) / d) * 380 * dt; s.y += ((owner.y - s.y) / d) * 380 * dt; }
+      }
     }
   }
 
@@ -921,7 +1362,7 @@ export class Arpg {
           if (Math.abs(d - wv.r) < wv.width + e.radius) {
             wv.hitSet.add(e);
             const ang = Math.atan2(e.y - wv.y, e.x - wv.x);
-            this.damageEnemy(e, wv.dmg, Math.cos(ang) * 300, Math.sin(ang) * 300);
+            this.damageEnemy(e, wv.dmg, Math.cos(ang) * 300, Math.sin(ang) * 300, wv.owner);
           }
         }
       }
@@ -940,20 +1381,23 @@ export class Arpg {
       for (let k = 0; k < 16; k++) {
         const a = (k / 16) * Math.PI * 2 + v.ang0;
         this.projs.push({
-          x: this.px + Math.cos(a) * 30, y: this.py + Math.sin(a) * 30,
+          x: v.p.x + Math.cos(a) * 30, y: v.p.y + Math.sin(a) * 30,
           vx: Math.cos(a) * 900, vy: Math.sin(a) * 900,
-          dmg: this.basicDmg() * 1.1, r: 4, friendly: true, pierce: false,
-          life: 0.65, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null,
+          dmg: this.basicDmg(v.p) * 1.1, r: 4, friendly: true, pierce: false,
+          life: 0.65, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null, owner: v.p,
         });
       }
-      this.spawnParticles(this.px, this.py, 10, "#ffd24a", 260);
-      this.addLight(this.px, this.py, 240, 0.15);
+      this.spawnParticles(v.p.x, v.p.y, 10, "#ffd24a", 260);
+      this.addLight(v.p.x, v.p.y, 240, 0.15);
       this.audio.sfx("hit");
       this.volleys.splice(i, 1);
     }
-    for (let i = this.trail.length - 1; i >= 0; i--) {
-      this.trail[i].life -= dt;
-      if (this.trail[i].life <= 0) this.trail.splice(i, 1);
+    // следы рывков всех игроков
+    for (const pl of this.players) {
+      for (let i = pl.trail.length - 1; i >= 0; i--) {
+        pl.trail[i].life -= dt;
+        if (pl.trail[i].life <= 0) pl.trail.splice(i, 1);
+      }
     }
     for (let i = this.corpses.length - 1; i >= 0; i--) {
       this.corpses[i].life -= dt;
@@ -989,28 +1433,323 @@ export class Arpg {
     }
   }
 
+  // ---------- сеть: снапшоты ----------
+
+  /** Хост рассылает состояние мира (10 раз в секунду). */
+  private sendSnap(): void {
+    if (!this.net) return;
+    const r1 = (v: number) => Math.round(v * 10) / 10;
+    const pl: SnapMsg["pl"] = {};
+    for (const p of this.players) {
+      pl[p.pid] = {
+        h: p.hero.id, x: r1(p.x), y: r1(p.y), fx: +p.facing.toFixed(2), wk: +p.walkPhase.toFixed(2), mv: p.moving,
+        hp: Math.ceil(p.hp), mh: p.maxHp, mn: Math.floor(p.mana), lv: p.level, dm: +p.dmgMul.toFixed(2),
+        sw: +Math.max(0, p.swingT).toFixed(2), sh: +Math.max(0, p.shieldT).toFixed(1), da: +Math.max(0, p.dashT).toFixed(2), al: p.alive,
+        // кулдауны для HUD клиента
+        ...({ cb: +Math.max(0, p.cdBasic).toFixed(1), cq: +Math.max(0, p.cdQ).toFixed(1), ce: +Math.max(0, p.cdE).toFixed(1), cr: +Math.max(0, p.cdR).toFixed(1), ct: +Math.max(0, p.cdT).toFixed(1) } as object),
+      } as SnapMsg["pl"][string];
+    }
+    const en: SnapMsg["en"] = [];
+    for (const e of this.enemies) {
+      if (e.nid === undefined) e.nid = this.nidSeq++;
+      en.push({
+        i: e.nid, k: ALL_ENEMY_KINDS.indexOf(e.kind), s: SPRITE_IDS.indexOf(e.sprite),
+        x: r1(e.x), y: r1(e.y), hp: Math.ceil(e.hp), mhp: Math.ceil(e.maxHp), b: e.boss, w: e.windup > 0,
+      });
+    }
+    const pr: SnapMsg["pr"] = [];
+    for (const p of this.projs) {
+      if (p.nid === undefined) p.nid = this.nidSeq++;
+      pr.push({ i: p.nid, k: p.kind, x: r1(p.x), y: r1(p.y), vx: Math.round(p.vx), vy: Math.round(p.vy), r: p.r, c: p.color, f: p.friendly });
+    }
+    this.net.sendSnap({
+      t: r1(this.time), wave: this.wave, kills: this.kills,
+      pl, en, pr,
+      orb: this.orbs.map((o) => [Math.round(o.x), Math.round(o.y)]),
+      sat: this.satorus.map((s) => ({ p: s.pid, x: r1(s.x), y: r1(s.y), l: +s.life.toFixed(1) })),
+    });
+  }
+
+  /** Клиент применяет снапшот: статы себе, позиции — остальным. */
+  private applySnap(s: SnapMsg): void {
+    this.kills = s.kills;
+    if (s.wave !== this.prevWave) {
+      this.prevWave = s.wave;
+      this.wave = s.wave;
+      this.announce(`ВОЛНА ${s.wave}`, "врагов больше, и они сильнее!");
+      this.audio.sfx("explosion");
+    }
+    // игроки
+    for (const [pid, sp] of Object.entries(s.pl)) {
+      const extra = sp as unknown as { cb: number; cq: number; ce: number; cr: number; ct: number };
+      let p = this.players.find((pl) => pl.pid === pid);
+      if (!p) {
+        p = makePlayer(pid, heroById(sp.h), pid === this.myPid);
+        p.x = sp.x; p.y = sp.y; p.tx = sp.x; p.ty = sp.y;
+        this.players.push(p);
+      }
+      if (p.isLocal) {
+        const prevHp = p.hp, prevLv = p.level;
+        p.hp = sp.hp; p.maxHp = sp.mh; p.mana = sp.mn; p.level = sp.lv; p.dmgMul = sp.dm;
+        p.shieldT = sp.sh; p.swingT = Math.max(p.swingT, 0);
+        p.cdBasic = extra.cb; p.cdQ = extra.cq; p.cdE = extra.ce; p.cdR = extra.cr; p.cdT = extra.ct;
+        if (sp.da > 0 && p.dashT <= 0) { p.dashT = sp.da; } // дэш, начатый на хосте по нашему же запросу
+        if (sp.hp < prevHp) { p.hurtFlash = 0.25; this.shake = Math.min(16, this.shake + 5); this.audio.sfx("hit"); }
+        if (sp.lv > prevLv) {
+          this.announce(`УРОВЕНЬ ${sp.lv}!`, "удары стали мощнее");
+          this.spawnParticles(p.x, p.y, 40, "#ffd24a", 320);
+          this.spawnWave(p.x, p.y, 200, "#ffd24a", 0, 18, 0.5);
+          this.addLight(p.x, p.y, 300, 0.4);
+          this.audio.sfx("win");
+        }
+        if (this.prevAlive && !sp.al) { this.announce("ВЫ ПАЛИ", "команда сражается дальше"); this.audio.sfx("lose"); }
+        this.prevAlive = sp.al;
+        p.alive = sp.al;
+      } else {
+        p.tx = sp.x; p.ty = sp.y; p.facing = sp.fx; p.walkPhase = sp.wk; p.moving = sp.mv;
+        p.hp = sp.hp; p.maxHp = sp.mh; p.level = sp.lv;
+        p.shieldT = sp.sh; p.dashT = sp.da; p.swingT = sp.sw; p.alive = sp.al;
+      }
+    }
+    // враги
+    const seen = new Set<number>();
+    for (const se of s.en) {
+      seen.add(se.i);
+      let e = this.enemyByNid.get(se.i);
+      if (!e) {
+        const kind = ALL_ENEMY_KINDS[se.k] ?? ALL_ENEMY_KINDS[0];
+        e = {
+          x: se.x, y: se.y, tx: se.x, ty: se.y, hp: se.hp, maxHp: se.mhp,
+          kind, boss: se.b, name: se.b ? "" : kind.name,
+          speed: kind.speed, dmg: kind.dmg, radius: se.b ? 36 : kind.radius, xp: kind.xp,
+          attackCd: 0, shootCd: 0, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
+          anim: Math.random() * 10, sprite: SPRITE_IDS[se.s] ?? "enemy-hockey", windup: 0, nid: se.i,
+        };
+        this.enemyByNid.set(se.i, e);
+        this.enemies.push(e);
+      }
+      e.tx = se.x; e.ty = se.y;
+      if (se.hp < e.hp) { e.flash = 0.12; this.spawnParticles(se.x, se.y, 3, e.kind.accent, 140); }
+      e.hp = se.hp; e.maxHp = se.mhp;
+      if (se.w && e.windup <= 0) e.windup = 0.25;
+      if (se.b && !e.boss) e.boss = true;
+    }
+    for (let i = this.enemies.length - 1; i >= 0; i--) {
+      const e = this.enemies[i];
+      if (e.nid !== undefined && !seen.has(e.nid)) {
+        this.clientKillFx(e);
+        this.enemyByNid.delete(e.nid);
+        this.enemies.splice(i, 1);
+      }
+    }
+    // снаряды: позиция из снапшота, между ними — экстраполяция по скорости
+    const seenPr = new Set<number>();
+    for (const sp of s.pr) {
+      seenPr.add(sp.i);
+      let pr = this.projByNid.get(sp.i);
+      if (!pr) {
+        pr = {
+          x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy, dmg: 0, r: sp.r,
+          friendly: sp.f, pierce: false, life: 3, color: sp.c, kind: sp.k,
+          disarm: false, hitSet: null, nid: sp.i,
+        };
+        this.projByNid.set(sp.i, pr);
+        this.projs.push(pr);
+      } else {
+        pr.x = sp.x; pr.y = sp.y; pr.vx = sp.vx; pr.vy = sp.vy; pr.life = 3;
+      }
+    }
+    for (let i = this.projs.length - 1; i >= 0; i--) {
+      const pr = this.projs[i];
+      if (pr.nid !== undefined && !seenPr.has(pr.nid)) {
+        if (pr.kind === "rasenshuriken") this.rasenBoomFx(pr.x, pr.y);
+        else if (pr.kind !== "bullet") this.spawnParticles(pr.x, pr.y, 3, pr.color, 120);
+        this.projByNid.delete(pr.nid);
+        this.projs.splice(i, 1);
+      }
+    }
+    // сферы здоровья и коты
+    this.orbs = s.orb.map(([x, y]) => ({ x, y, heal: 15, t: 0 }));
+    const seenSat = new Set<string>();
+    for (const ss of s.sat) {
+      seenSat.add(ss.p);
+      let cat = this.satorus.find((c) => c.pid === ss.p);
+      if (!cat) {
+        cat = { x: ss.x, y: ss.y, life: ss.l, swipeCd: 0, pid: ss.p };
+        this.satorus.push(cat);
+        this.spawnParticles(ss.x, ss.y - 40, 24, "#e8e8e8", 240);
+        this.audio.sfx("win");
+      }
+      cat.x = ss.x; cat.y = ss.y; cat.life = ss.l;
+    }
+    this.satorus = this.satorus.filter((c) => seenSat.has(c.pid));
+  }
+
+  /** Эффекты смерти врага на клиенте (снапшот просто перестаёт его присылать). */
+  private clientKillFx(e: Enemy): void {
+    this.corpses.push({
+      x: e.tx ?? e.x, y: e.ty ?? e.y, sprite: e.sprite,
+      life: 1.4, flip: this.px > e.x, scale: (e.boss ? 2 : 1) * (e.kind.scaleMul ?? 1),
+    });
+    if (this.corpses.length > 30) this.corpses.shift();
+    this.decals.push({ x: e.tx ?? e.x, y: e.ty ?? e.y, r: e.boss ? 46 : 18 + Math.random() * 14, color: "#6e1010", alpha: 0.55 });
+    if (this.decals.length > 250) this.decals.shift();
+    this.spawnParticles(e.tx ?? e.x, e.ty ?? e.y, e.boss ? 40 : 14, e.kind.accent, e.boss ? 380 : 240);
+    this.audio.sfx("explosion");
+    if (e.boss) {
+      this.spawnWave(e.tx ?? e.x, e.ty ?? e.y, 260, "#ffd24a", 0, 22, 0.6);
+      this.addLight(e.tx ?? e.x, e.ty ?? e.y, 360, 0.5);
+      this.shake = Math.min(20, this.shake + 12);
+    }
+  }
+
+  /** Взрыв Расен-сюрикена на клиенте. */
+  private rasenBoomFx(x: number, y: number): void {
+    this.spawnWave(x, y, 330, "#7ec8ff", 0, 34, 0.55);
+    this.spawnWave(x, y, 210, "#ffffff", 0, 16, 0.4);
+    this.spawnParticles(x, y, 36, "#7ec8ff", 420);
+    this.addLight(x, y, 400, 0.4);
+    this.shake = Math.min(20, this.shake + 10);
+    this.audio.sfx("explosion");
+  }
+
+  /** Сетевые события от хоста (анонсы, чужие касты). */
+  private applyEv(d: EvMsg): void {
+    if (d.t === "ann") {
+      this.announce(d.x, d.s);
+      this.audio.sfx("explosion");
+    } else if (d.t === "castfx") {
+      this.spawnCastFx(d.h, d.k, d.x, d.y, d.dir);
+    } else if (d.t === "boom") {
+      this.rasenBoomFx(d.x, d.y);
+    } else if (d.t === "over") {
+      this.overStats = { time: d.time, kills: d.kills, level: this.level, wave: d.wave };
+      this.state = "over";
+      this.leaveNetAfter();
+      this.audio.sfx("lose");
+      this.audio.stopMusic();
+    }
+  }
+
+  /** Визуал чужого каста на клиенте (урона нет — его считает хост). */
+  private spawnCastFx(heroId: string, k: string, x: number, y: number, dir: number): void {
+    if (k === "q" && heroId === "maxim") {
+      this.spawnParticles(x, y, 36, "#7ec8ff", 380);
+      this.spawnWave(x, y, 190, "#7ec8ff", 0, 20, 0.4);
+      this.addLight(x, y, 260, 0.25);
+      this.audio.sfx("explosion");
+    } else if (k === "e" && heroId === "vika") {
+      this.spawnParticles(x, y, 20, "#b58cff", 180);
+      this.audio.sfx("win");
+    } else if (k === "r") {
+      if (heroId === "nikita") {
+        this.spawnWave(x, y, 240, "#7ec8ff", 0, 22, 0.5);
+        this.addLight(x, y, 320, 0.3);
+      } else if (heroId === "vika") {
+        this.spawnWave(x, y, 430, "#3ddc84", 0, 36, 0.7);
+        this.spawnWave(x, y, 300, "#b0ffd0", 0, 18, 0.55);
+        this.spawnParticles(x, y, 40, "#3ddc84", 380);
+        this.addLight(x, y, 430, 0.5);
+      } else {
+        this.addLight(x, y, 260, 0.2);
+      }
+      this.audio.sfx("explosion");
+    } else if (k === "t") {
+      this.spawnParticles(x, y - 40, 24, "#e8e8e8", 240);
+      this.audio.sfx("win");
+    } else if (k === "lvl") {
+      this.spawnParticles(x, y, 40, "#ffd24a", 320);
+      this.spawnWave(x, y, 200, "#ffd24a", 0, 18, 0.5);
+      this.addLight(x, y, 300, 0.4);
+    }
+    void dir;
+  }
+
+  /** Клиентское движение сущностей между снапшотами. */
+  private updateClientEntities(dt: number): void {
+    for (const p of this.players) {
+      if (p.isLocal) continue;
+      const k = Math.min(1, dt * 15);
+      p.x += (p.tx - p.x) * k;
+      p.y += (p.ty - p.y) * k;
+      p.swingT -= dt; p.shieldT -= dt; p.dashT -= dt;
+    }
+    for (const e of this.enemies) {
+      const k = Math.min(1, dt * 12);
+      e.x += ((e.tx ?? e.x) - e.x) * k;
+      e.y += ((e.ty ?? e.y) - e.y) * k;
+      e.anim += dt * (0.6 + e.speed / 90);
+      e.flash -= dt; e.windup -= dt;
+    }
+    for (const pr of this.projs) {
+      pr.x += pr.vx * dt;
+      pr.y += pr.vy * dt;
+    }
+  }
+
   // ---------- клики ----------
+
+  private setLobbyHero(i: number): void {
+    this.selIndex = i;
+    this.audio.sfx("ui");
+    if (this.netMode === "host") {
+      const lp = this.lobbyPlayers.find((p) => p.pid === this.myPid);
+      if (lp) lp.hero = HEROES[i].id;
+      this.broadcastLobby();
+    } else if (this.net && this.hostPeerId) {
+      this.net.sendHero({ pid: this.myPid, hero: HEROES[i].id } as never);
+    }
+  }
 
   private onClick(cx: number, cy: number): void {
     if (this.state === "select") {
+      if (this.selScreen === "join") return; // там всё с клавиатуры
+      for (const b of this.menuBtns) {
+        if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h) {
+          this.audio.sfx("ui");
+          if (b.act === "solo") { this.netMode = "off"; this.startRun(HEROES[this.selIndex]); }
+          else if (b.act === "create") this.createLobby();
+          else if (b.act === "join") { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; }
+          return;
+        }
+      }
       for (let i = 0; i < this.cardRects.length; i++) {
         const r = this.cardRects[i];
         if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) {
-          if (this.selIndex === i) { this.audio.sfx("ui"); this.startRun(HEROES[i]); }
+          if (this.selIndex === i) { this.audio.sfx("ui"); this.netMode = "off"; this.startRun(HEROES[i]); }
           else { this.selIndex = i; this.audio.sfx("ui"); }
+          return;
+        }
+      }
+    } else if (this.state === "lobby") {
+      for (let i = 0; i < this.cardRects.length; i++) {
+        const r = this.cardRects[i];
+        if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) { this.setLobbyHero(i); return; }
+      }
+      for (const b of this.menuBtns) {
+        if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h) {
+          if (b.act === "start" && this.netMode === "host" && this.lobbyPlayers.length >= 2) { this.audio.sfx("ui"); this.hostStartCoop(); }
+          else if (b.act === "leave") { this.leaveNet(); this.state = "select"; this.selScreen = "heroes"; this.audio.sfx("ui"); }
           return;
         }
       }
     } else if (this.state === "over") {
       this.state = "select";
+      this.selScreen = "heroes";
       this.audio.sfx("ui");
     }
   }
 
   // ---------- камера ----------
 
-  private camX(): number { return Math.max(0, Math.min(WORLD_SIZE - this.w, this.px - this.w / 2)); }
-  private camY(): number { return Math.max(0, Math.min(WORLD_SIZE - this.h, this.py - this.h / 2)); }
+  /** Точка, за которой следует камера: живой локальный игрок, иначе наблюдение за командой. */
+  private camTarget(): PlayerEnt {
+    if (this.me.alive) return this.me;
+    return this.players.find((p) => p.alive) ?? this.me;
+  }
+
+  private camX(): number { return Math.max(0, Math.min(WORLD_SIZE - this.w, this.camTarget().x - this.w / 2)); }
+  private camY(): number { return Math.max(0, Math.min(WORLD_SIZE - this.h, this.camTarget().y - this.h / 2)); }
 
   /** Позиция игрока для self-check (W = вперёд = z уменьшается). */
   probe(): { x: number; y: number; z: number } {
@@ -1019,6 +1758,14 @@ export class Arpg {
 
   /** Текущее состояние для автотестов. */
   get stateName(): string { return this.state; }
+
+  /** Сетевая диагностика для автотестов коопа. */
+  netInfo(): { mode: string; code: string; lobby: number; enemies: number; players: number } {
+    return {
+      mode: this.netMode, code: this.net?.code ?? "",
+      lobby: this.lobbyPlayers.length, enemies: this.enemies.length, players: this.players.length,
+    };
+  }
 
   /** Отладочные хуки для автопроверки (не используются в игре). */
   debugBoss(): void { this.nextBossAt = 0; }
@@ -1030,6 +1777,7 @@ export class Arpg {
     const ctx = this.ctx;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     if (this.state === "select") { this.renderSelect(ctx); return; }
+    if (this.state === "lobby") { this.renderLobby(ctx); return; }
     const camX = this.camX() + (Math.random() - 0.5) * this.shake;
     const camY = this.camY() + (Math.random() - 0.5) * this.shake;
     let tSec = performance.now();
@@ -1085,14 +1833,15 @@ export class Arpg {
       }
 
     // след рывка: у Максима — молнии Чидори, у остальных — шлейф
-    if (this.trail.length > 1) {
-      if (this.hero.id === "maxim") {
+    for (const pl of this.players) {
+      if (pl.trail.length <= 1) continue;
+      if (pl.hero.id === "maxim") {
         for (let pass = 0; pass < 2; pass++) {
           ctx.strokeStyle = pass === 0 ? "rgba(126,200,255,0.35)" : "rgba(240,250,255,0.8)";
           ctx.lineWidth = pass === 0 ? 7 : 2.5;
           ctx.beginPath();
           let first = true;
-          for (const tp of this.trail) {
+          for (const tp of pl.trail) {
             const jx = tp.x - camX + (Math.random() - 0.5) * 10;
             const jy = tp.y - camY - 20 + (Math.random() - 0.5) * 10;
             if (first) { ctx.moveTo(jx, jy); first = false; } else ctx.lineTo(jx, jy);
@@ -1100,9 +1849,9 @@ export class Arpg {
           ctx.stroke();
         }
       } else {
-        for (const tp of this.trail) {
+        for (const tp of pl.trail) {
           ctx.globalAlpha = tp.life / 0.35 * 0.3;
-          ctx.fillStyle = this.hero.themeColor;
+          ctx.fillStyle = pl.hero.themeColor;
           ctx.beginPath(); ctx.arc(tp.x - camX, tp.y - camY - 14, 14, 0, Math.PI * 2); ctx.fill();
         }
         ctx.globalAlpha = 1;
@@ -1116,8 +1865,11 @@ export class Arpg {
       if (sx < -120 || sx > this.w + 120 || sy < -160 || sy > this.h + 120) continue;
       this.drawEnemy(ctx, e, camX, camY);
     }
-    if (this.satoru) this.drawSatoru(ctx, camX, camY);
-    this.drawPlayer(ctx, camX, camY);
+    for (const s of this.satorus) this.drawSatoru(ctx, s, camX, camY);
+    for (const p of this.players) {
+      if (p.isLocal) this.drawPlayer(ctx, camX, camY);
+      else this.drawRemotePlayer(ctx, p, camX, camY);
+    }
     this.perfSec[1] += performance.now() - tSec; tSec = performance.now();
 
     // снаряды
@@ -1244,8 +1996,10 @@ export class Arpg {
       lc.fillStyle = g;
       lc.beginPath(); lc.arc(x, y, r, 0, Math.PI * 2); lc.fill();
     };
-    light(this.px - camX, this.py - camY, this.map.id === "arena" ? 240 : 300);
-    if (this.satoru) light(this.satoru.x - camX, this.satoru.y - camY, 170, 0.9);
+    for (const p of this.players) {
+      if (p.alive) light(p.x - camX, p.y - camY, this.map.id === "arena" ? 240 : 300);
+    }
+    for (const s of this.satorus) light(s.x - camX, s.y - camY, 170, 0.9);
     for (const e of this.enemies) if (e.boss) light(e.x - camX, e.y - camY, 140, 0.8);
     // вспышки взрывов и заклинаний
     for (const tl of this.tempLights) light(tl.x - camX, tl.y - camY, tl.r, Math.min(1.1, (tl.life / tl.maxLife) * 1.2));
@@ -1424,6 +2178,18 @@ export class Arpg {
 
   private drawPlayer(ctx: CanvasRenderingContext2D, camX: number, camY: number): void {
     const x = this.px - camX, y = this.py - camY;
+    if (!this.me.alive) {
+      // призрак павшего героя в коопе
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+      this.drawPuppet(ctx, "hero-" + this.hero.id, x, y + 26, 76, { flip: false, walk: 0 });
+      ctx.restore();
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#c8352a";
+      ctx.font = "bold 14px Georgia";
+      ctx.fillText("ВЫ ПАЛИ", x, y - 60);
+      return;
+    }
     // тень
     ctx.fillStyle = "rgba(0,0,0,0.4)";
     ctx.beginPath(); ctx.ellipse(x, y + 20, 22, 8, 0, 0, Math.PI * 2); ctx.fill();
@@ -1564,13 +2330,52 @@ export class Arpg {
     }
   }
 
-  private drawSatoru(ctx: CanvasRenderingContext2D, camX: number, camY: number): void {
-    const s = this.satoru!;
+  /** Удалённый игрок в коопе: кукла его героя, имя и полоса HP над головой. */
+  private drawRemotePlayer(ctx: CanvasRenderingContext2D, p: PlayerEnt, camX: number, camY: number): void {
+    const x = p.x - camX, y = p.y - camY;
+    if (x < -100 || x > this.w + 100 || y < -140 || y > this.h + 100) return;
+    ctx.fillStyle = "rgba(0,0,0,0.4)";
+    ctx.beginPath(); ctx.ellipse(x, y + 20, 22, 8, 0, 0, Math.PI * 2); ctx.fill();
+    const flip = Math.cos(p.facing) < 0;
+    const walk = p.moving ? p.walkPhase * 11 : 0;
+    const attackT = p.swingT > 0 ? 1 - Math.min(1, p.swingT / 0.18) : 0;
+    const idleBob = p.moving ? 0 : Math.sin(this.time * 2) * 1.2;
+    ctx.save();
+    if (!p.alive) ctx.globalAlpha = 0.3;
+    this.drawPuppet(ctx, "hero-" + p.hero.id, x, y + 26 + idleBob, 76, { flip, walk, attackT });
+    ctx.restore();
+    // купол Протего чужого игрока
+    if (p.shieldT > 0 && p.alive) {
+      const a = 0.35 + Math.sin(this.time * 9) * 0.12;
+      ctx.strokeStyle = `rgba(230,210,255,${a + 0.25})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(x, y - 18, 40, 52, 0, 0, Math.PI * 2); ctx.stroke();
+    }
+    // имя и HP
+    ctx.textAlign = "center";
+    ctx.fillStyle = p.alive ? "#ffe9b0" : "#8a8078";
+    ctx.font = "bold 13px Georgia";
+    ctx.fillText(p.hero.name, x, y - 66);
+    if (p.alive && p.hp < p.maxHp) {
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(x - 26, y - 60, 52, 5);
+      ctx.fillStyle = "#5ee87a";
+      ctx.fillRect(x - 26, y - 60, 52 * Math.max(0, p.hp / p.maxHp), 5);
+    }
+    if (!p.alive) {
+      ctx.fillStyle = "#c8352a";
+      ctx.font = "bold 12px Georgia";
+      ctx.fillText("ПАЛ", x, y - 80);
+    }
+  }
+
+  private drawSatoru(ctx: CanvasRenderingContext2D, s: SatoruEnt, camX: number, camY: number): void {
     const x = s.x - camX, y = s.y - camY;
     ctx.fillStyle = "rgba(0,0,0,0.35)";
     ctx.beginPath(); ctx.ellipse(x, y + 16, 26, 9, 0, 0, Math.PI * 2); ctx.fill();
     // бегущий кот: лапы перебирают в противофазе
-    const flip = Math.cos(Math.atan2(this.py - s.y, this.px - s.x)) < 0;
+    const owner = this.players.find((p) => p.pid === s.pid) ?? this.me;
+    const flip = Math.cos(Math.atan2(owner.y - s.y, owner.x - s.x)) < 0;
     this.drawPuppet(ctx, "satoru", x, y + 18, 56, { flip, walk: this.time * 16, cat: true });
     // удар когтями — дуги
     if (s.swipeCd > 0.35) {
@@ -1617,6 +2422,28 @@ export class Arpg {
     ctx.fillStyle = "rgba(232,217,176,0.6)";
     ctx.font = "13px Georgia";
     ctx.fillText(`усиление врагов через ${Math.ceil(toWave)} c`, w / 2, 74);
+
+    // команда в коопе (слева сверху)
+    if (this.netMode !== "off") {
+      ctx.textAlign = "left";
+      let ty = 20;
+      for (const p of this.players) {
+        ctx.fillStyle = "rgba(10,8,6,0.72)";
+        ctx.fillRect(14, ty - 13, 190, 30);
+        ctx.strokeStyle = p.isLocal ? "#c9a15a" : "#4a3f32";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(14, ty - 13, 190, 30);
+        ctx.fillStyle = p.alive ? "#f0e6d0" : "#7a7066";
+        ctx.font = "bold 12px Georgia";
+        ctx.fillText(`${p.hero.name}${p.isLocal ? " (ты)" : ""} • ${p.level}`, 22, ty + 6);
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(120, ty - 6, 72, 7);
+        ctx.fillStyle = p.alive ? "#5ee87a" : "#5a2020";
+        ctx.fillRect(120, ty - 6, 72 * Math.max(0, p.hp / p.maxHp), 7);
+        ty += 38;
+      }
+      ctx.textAlign = "center";
+    }
 
     // босс
     const boss = this.enemies.find((e) => e.boss);
@@ -1889,6 +2716,185 @@ export class Arpg {
     ctx.font = "15px Georgia";
     ctx.fillText("Каждые 30 секунд врагов становится больше и они сильнее. Каждые 90 секунд — босс.", w / 2, y0 + ch + 44);
     ctx.fillText("Убийства дают опыт: уровень повышает урон и здоровье.", w / 2, y0 + ch + 68);
+
+    // кнопки режимов
+    this.menuBtns = [];
+    const bw = 220, bh = 52, bgap = 24;
+    const bx = w / 2 - (3 * bw + 2 * bgap) / 2;
+    const by = y0 + ch + 88;
+    const btns: Array<{ act: string; label: string; sub: string; color: string }> = [
+      { act: "solo", label: "ИГРАТЬ ОДНОМУ", sub: "Space", color: "#8a6d3b" },
+      { act: "create", label: "СОЗДАТЬ ЛОББИ", sub: "C", color: "#3d6b3a" },
+      { act: "join", label: "ВОЙТИ ПО КОДУ", sub: "J", color: "#3a5a7a" },
+    ];
+    for (let i = 0; i < btns.length; i++) {
+      const x = bx + i * (bw + bgap);
+      this.menuBtns.push({ x, y: by, w: bw, h: bh, act: btns[i].act });
+      const hover = this.mx >= x && this.mx <= x + bw && this.my >= by && this.my <= by + bh;
+      ctx.fillStyle = hover ? "rgba(50,38,26,0.95)" : "rgba(20,15,12,0.92)";
+      ctx.fillRect(x, by, bw, bh);
+      ctx.strokeStyle = hover ? "#e8d9b0" : btns[i].color;
+      ctx.lineWidth = hover ? 3 : 2;
+      ctx.strokeRect(x, by, bw, bh);
+      ctx.fillStyle = "#f0e6d0";
+      ctx.font = "bold 16px Georgia";
+      ctx.fillText(btns[i].label, x + bw / 2, by + 24);
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "12px Georgia";
+      ctx.fillText(`клавиша ${btns[i].sub}`, x + bw / 2, by + 42);
+    }
+
+    // экран ввода кода лобби
+    if (this.selScreen === "join") {
+      ctx.fillStyle = "rgba(4,3,6,0.88)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e8d9b0";
+      ctx.font = "bold 34px Georgia";
+      ctx.fillText("ВВЕДИ КОД ЛОББИ", w / 2, h / 2 - 90);
+      ctx.font = "16px Georgia";
+      ctx.fillStyle = "#8f8272";
+      ctx.fillText("Спроси код у друга, который создал лобби (клавиша C)", w / 2, h / 2 - 56);
+      // окошко кода
+      const cw2 = 320;
+      ctx.fillStyle = "rgba(20,15,12,0.95)";
+      ctx.fillRect(w / 2 - cw2 / 2, h / 2 - 30, cw2, 84);
+      ctx.strokeStyle = "#c9a15a";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(w / 2 - cw2 / 2, h / 2 - 30, cw2, 84);
+      ctx.fillStyle = "#ffd24a";
+      ctx.font = "bold 44px 'Courier New', monospace";
+      const code = this.joinCode.padEnd(5, "·");
+      ctx.fillText(code.split("").join(" "), w / 2, h / 2 + 26);
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "15px Georgia";
+      ctx.fillText("Enter — войти • Backspace — стереть • Esc — назад", w / 2, h / 2 + 90);
+      if (this.lobbyError) {
+        ctx.fillStyle = "#e84a4a";
+        ctx.font = "bold 16px Georgia";
+        ctx.fillText(this.lobbyError, w / 2, h / 2 + 124);
+      }
+    }
+  }
+
+  /** Экран лобби: код комнаты, список игроков, выбор героя. */
+  private renderLobby(ctx: CanvasRenderingContext2D): void {
+    const w = this.w, h = this.h;
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "#070509");
+    g.addColorStop(0.6, "#0e0a14");
+    g.addColorStop(1, "#101a12");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#c9a15a";
+    ctx.font = "bold 40px Georgia";
+    ctx.fillText("ЛОББИ", w / 2, 76);
+
+    // код комнаты
+    if (this.netMode === "host") {
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "17px Georgia";
+      ctx.fillText("Позови друзей: они жмут «Войти по коду» (J) и вводят:", w / 2, 116);
+      ctx.fillStyle = "#ffd24a";
+      ctx.font = "bold 58px 'Courier New', monospace";
+      ctx.shadowColor = "rgba(255,210,74,0.5)";
+      ctx.shadowBlur = 18;
+      ctx.fillText((this.net?.code ?? "").split("").join(" "), w / 2, 178);
+      ctx.shadowBlur = 0;
+    } else {
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "18px Georgia";
+      ctx.fillText(
+        this.hostPeerId ? `Подключено к лобби ${this.net?.code}` : `Подключение к ${this.net?.code}…`,
+        w / 2, 150,
+      );
+    }
+
+    // игроки
+    ctx.fillStyle = "#e8d9b0";
+    ctx.font = "bold 22px Georgia";
+    ctx.fillText(`Игроки (${this.lobbyPlayers.length || 1}/6):`, w / 2, 232);
+    ctx.font = "19px Georgia";
+    const list = this.lobbyPlayers.length ? this.lobbyPlayers : [{ pid: this.myPid, hero: HEROES[this.selIndex].id, host: this.netMode === "host" }];
+    for (let i = 0; i < list.length; i++) {
+      const lp = list[i];
+      const hh = heroById(lp.hero);
+      const y = 268 + i * 34;
+      ctx.fillStyle = lp.pid === this.myPid ? "#ffd24a" : "#d8cbaa";
+      ctx.fillText(`${hh.name} — ${hh.title}${lp.host ? " 👑" : ""}${lp.pid === this.myPid ? " (ты)" : ""}`, w / 2, y);
+    }
+
+    // выбор героя — те же карточки, компактно
+    const cw = 150, ch = 190, gap = 18;
+    const total = HEROES.length * (cw + gap) - gap;
+    const x0 = w / 2 - total / 2;
+    const y0 = 268 + list.length * 34 + 24;
+    this.cardRects = [];
+    for (let i = 0; i < HEROES.length; i++) {
+      const hero = HEROES[i];
+      const x = x0 + i * (cw + gap);
+      this.cardRects.push({ x, y: y0, w: cw, h: ch });
+      const sel = i === this.selIndex;
+      ctx.fillStyle = sel ? "rgba(52,26,20,0.95)" : "rgba(16,12,14,0.92)";
+      ctx.fillRect(x, y0, cw, ch);
+      ctx.strokeStyle = sel ? "#c9a15a" : "#3a2f28";
+      ctx.lineWidth = sel ? 3 : 1.5;
+      ctx.strokeRect(x, y0, cw, ch);
+      const himg = this.sprites.get("hero-" + hero.id);
+      if (himg && himg.complete && himg.naturalWidth > 0) {
+        const hh2 = 104, ww = hh2 * (himg.width / himg.height);
+        ctx.drawImage(himg, x + cw / 2 - ww / 2, y0 + 8, ww, hh2);
+      }
+      ctx.fillStyle = "#f0e6d0";
+      ctx.font = "bold 17px Georgia";
+      ctx.fillText(hero.name, x + cw / 2, y0 + 134);
+      ctx.fillStyle = "#b8a888";
+      ctx.font = "12px Georgia";
+      ctx.fillText(hero.weaponName, x + cw / 2, y0 + 154);
+      ctx.fillStyle = "#6f6578";
+      ctx.font = "bold 12px Arial";
+      ctx.fillText(`[ ${i + 1} ]`, x + cw / 2, y0 + 176);
+    }
+
+    // кнопки
+    this.menuBtns = [];
+    const by = y0 + ch + 26;
+    if (this.netMode === "host") {
+      const bw = 260, bh = 52;
+      this.menuBtns.push({ x: w / 2 - bw / 2, y: by, w: bw, h: bh, act: "start" });
+      const can = this.lobbyPlayers.length >= 2;
+      ctx.fillStyle = can ? "rgba(40,60,30,0.95)" : "rgba(24,20,16,0.9)";
+      ctx.fillRect(w / 2 - bw / 2, by, bw, bh);
+      ctx.strokeStyle = can ? "#7ab54a" : "#4a3f32";
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(w / 2 - bw / 2, by, bw, bh);
+      ctx.fillStyle = can ? "#d8f0b0" : "#8f8272";
+      ctx.font = "bold 20px Georgia";
+      ctx.fillText(can ? "НАЧАТЬ БОЙ (Space)" : "ЖДЁМ ИГРОКОВ…", w / 2, by + 33);
+    } else {
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "17px Georgia";
+      ctx.fillText("Ждём, пока хост начнёт бой…", w / 2, by + 30);
+    }
+    // выход
+    const lw = 200, lh = 40;
+    this.menuBtns.push({ x: w / 2 - lw / 2, y: by + 66, w: lw, h: lh, act: "leave" });
+    ctx.fillStyle = "rgba(30,18,16,0.9)";
+    ctx.fillRect(w / 2 - lw / 2, by + 66, lw, lh);
+    ctx.strokeStyle = "#6a4a3a";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(w / 2 - lw / 2, by + 66, lw, lh);
+    ctx.fillStyle = "#c89a8a";
+    ctx.font = "15px Georgia";
+    ctx.fillText("Покинуть лобби (Esc)", w / 2, by + 91);
+
+    if (this.lobbyError) {
+      ctx.fillStyle = "#e84a4a";
+      ctx.font = "bold 16px Georgia";
+      ctx.fillText(this.lobbyError, w / 2, by + 132);
+    }
   }
 
   private renderOver(ctx: CanvasRenderingContext2D): void {

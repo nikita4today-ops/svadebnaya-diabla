@@ -214,3 +214,37 @@ export const XP_BASE = 42;
 export const WAVE_PERIOD = 30; // каждые 30 секунд врагов больше и они сильнее
 export const BOSS_PERIOD = 90;
 export const SATORU_DURATION = 12;
+
+/** Базовый спрайт вида врага (если нет предзапечённого варианта). */
+export function kindSprite(k: EnemyKindDef): string {
+  return k.spriteVar ?? ({
+    loko: "enemy-hockey",
+    akatsuki: "enemy-akatsuki",
+    gnome: "enemy-gnome",
+    deatheater: "enemy-deatheater",
+  } as Record<string, string>)[k.id] ?? "enemy-hockey";
+}
+
+/** Кооп-режим: все враги со всех четырёх карт в одном пуле. */
+export const ALL_ENEMY_KINDS: EnemyKindDef[] = [
+  ...MAPS.arena.enemies,
+  ...MAPS.odintsovo.enemies,
+  ...MAPS.school.enemies,
+  ...MAPS.hogwarts.enemies,
+];
+
+/** Боссы кооп-режима: выходят по очереди, по одному с каждой карты. */
+export const COOP_BOSSES = [
+  { name: MAPS.arena.bossName, color: MAPS.arena.bossColor, sprite: "enemy-hockey" },
+  { name: MAPS.odintsovo.bossName, color: MAPS.odintsovo.bossColor, sprite: "enemy-akatsuki" },
+  { name: MAPS.school.bossName, color: MAPS.school.bossColor, sprite: "enemy-gnome" },
+  { name: MAPS.hogwarts.bossName, color: MAPS.hogwarts.bossColor, sprite: "enemy-deatheater" },
+];
+
+/** Карта кооп-режима: арена как нейтральная площадка, враги — со всех карт. */
+export const COOP_MAP: MapDef = {
+  ...MAPS.arena,
+  name: "Совместный рейд",
+  subtitle: "все фронты в одном бою",
+  enemies: ALL_ENEMY_KINDS,
+};

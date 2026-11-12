@@ -25,6 +25,7 @@ export function startGame(canvas: HTMLCanvasElement): void {
   window.__gameProbe = () => game.probe();
   (window as unknown as { __gameState?: () => string }).__gameState = () => game.stateName;
   (window as unknown as { __perf?: () => { update: number; render: number; frames: number } }).__perf = () => game.perfStats();
+  (window as unknown as { __netInfo?: () => unknown }).__netInfo = () => game.netInfo();
   (window as unknown as { __debug?: Record<string, () => void> }).__debug = {
     boss: () => game.debugBoss(),
     heal: () => game.debugHeal(),
