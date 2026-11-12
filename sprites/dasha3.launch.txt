@@ -1,0 +1,2 @@
+Job log: C:\Users\ecp\AppData\Local\Temp\image_generation-job-dmhrc43x\worker.log
+Job PID file: C:\Users\ecp\AppData\Local\Temp\image_generation-job-dmhrc43x\worker.pid
