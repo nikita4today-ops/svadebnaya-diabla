@@ -31,7 +31,9 @@ const server = createServer(async (req, res) => {
   } catch { res.writeHead(404).end(); }
 });
 await new Promise((r) => server.listen(0, r));
-const URL_ = `http://127.0.0.1:${server.address().port}/`;
+const REMOTE = process.argv[2];
+const URL_ = REMOTE || `http://127.0.0.1:${server.address().port}/`;
+if (REMOTE) server.close();
 
 const browser = await chromium.launch({ args: ["--use-gl=angle", "--enable-unsafe-swiftshader"] });
 const errors = { host: [], client: [] };

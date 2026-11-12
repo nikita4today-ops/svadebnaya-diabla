@@ -30,6 +30,7 @@ export function startGame(canvas: HTMLCanvasElement): void {
     boss: () => game.debugBoss(),
     heal: () => game.debugHeal(),
   };
+  (window as unknown as { __dbg?: () => unknown }).__dbg = () => game.debugInfo();
   // первый отрисованный кадр — страница играбельна
   const markReady = () => {
     window.__GAME_READY__ = true;

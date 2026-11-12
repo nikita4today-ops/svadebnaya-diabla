@@ -1,6 +1,7 @@
 /**
- * skills-check.mjs — визуальная проверка новых ультимейтов (R) и зова САТОРУ (T)
- * у всех четырёх героев. Только для процесса разработки.
+ * skills-check.mjs — визуальная проверка скиллов R (маунт/клон),
+ * ультимейтов (T) и зова САТОРУ (F) у всех четырёх героев.
+ * Только для процесса разработки.
  */
 import { chromium } from "playwright";
 import { createServer } from "node:http";
@@ -52,12 +53,18 @@ for (let h = 0; h < 4; h++) {
   await page.keyboard.press("Space");
   await page.waitForTimeout(2500); // враги подходят
   await page.evaluate(() => window.__debug && window.__debug.heal());
-  // ультимейт R
+  // скилл R (маунт/клон)
+  await page.evaluate(() => window.__debug && window.__debug.heal());
   await page.keyboard.press("KeyR");
-  await page.waitForTimeout(260);
-  await page.screenshot({ path: join(SHOTS, `ult-${NAMES[h]}.png`) });
-  // зов САТОРУ на T
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: join(SHOTS, `mount-${NAMES[h]}.png`) });
+  // ультимейт T
+  await page.evaluate(() => window.__debug && window.__debug.heal());
   await page.keyboard.press("KeyT");
+  await page.waitForTimeout(600);
+  await page.screenshot({ path: join(SHOTS, `ult-${NAMES[h]}.png`) });
+  // зов САТОРУ на F
+  await page.keyboard.press("KeyF");
   await page.waitForTimeout(700);
   await page.screenshot({ path: join(SHOTS, `satoru-${NAMES[h]}.png`) });
   const state = await page.evaluate(() => window.__gameState());

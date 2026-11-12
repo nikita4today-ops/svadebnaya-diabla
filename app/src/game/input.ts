@@ -33,6 +33,8 @@ export class Input {
   pitchDelta = 0;
   /** Instantaneous actions (true on the frame the key is pressed; auto-cleared once consumed). */
   readonly actions = new Set<string>();
+  /** Коды нажатий в порядке нажатия — для полей ввода (код лобби), где порядок важен. */
+  private pressQueue: string[] = [];
   private held = new Set<string>();
   private touchMoveId: number | null = null;
   private touchAimId: number | null = null;
@@ -59,6 +61,8 @@ export class Input {
       const m = KEYMAP[e.code];
       if (m) this.held.add(e.code);
       this.actions.add(e.code); // e.g. "KeyE" / "Escape" / "Space" are consumed directly by code
+      this.pressQueue.push(e.code);
+      if (this.pressQueue.length > 32) this.pressQueue.shift();
       this.recomputeAxes();
     });
     on<KeyboardEvent>(window, "keyup", (e) => {
@@ -131,6 +135,7 @@ export class Input {
 
   private resetAll(): void {
     this.held.clear();
+    this.pressQueue = [];
     this.touchMoveId = null;
     this.touchAimId = null;
     this.yawDelta = 0;
@@ -163,6 +168,13 @@ export class Input {
     const has = this.actions.has(code);
     if (has) this.actions.delete(code);
     return has;
+  }
+
+  /** Забрать коды нажатий в порядке нажатия (для полей ввода). */
+  drainPresses(): string[] {
+    const q = this.pressQueue;
+    this.pressQueue = [];
+    return q;
   }
 }
 

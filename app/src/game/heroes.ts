@@ -30,9 +30,9 @@ export interface HeroDef {
   themeColor: string;
   q: AbilityDef;
   e: AbilityDef;
-  /** Массовый ультимейт (клавиша R). */
+  /** Массовый скилл (клавиша R). */
   r: AbilityDef;
-  /** Зов САТОРУ — пятый скилл (клавиша T). */
+  /** Ультимейт героя (клавиша T). */
   ult: AbilityDef;
 }
 
@@ -65,9 +65,10 @@ export interface MapDef {
 
 export const WORLD_SIZE = 2600;
 
-const SATORU: AbilityDef = {
+/** Зов САТОРУ — общий скилл всех героев (клавиша F). */
+export const SATORU: AbilityDef = {
   name: "Зов САТОРУ",
-  keyLabel: "T",
+  keyLabel: "F",
   cooldown: 40,
   desc: "Кот САТОРУ прибегает и 12 секунд рвёт врагов когтями",
 };
@@ -76,62 +77,62 @@ export const HEROES: HeroDef[] = [
   {
     id: "nikita",
     name: "Никита",
-    title: "Хоккеист возмездия",
+    title: "Танк • Хоккеист возмездия",
     face: "faces/nikita.png",
     mapId: "arena",
     mapName: "Хоккейная арена, Омск",
     cloth: "#f2f2f0",
     accent: "#d33a2c",
     weaponName: "Клюшка",
-    hp: 150,
-    speed: 265,
+    hp: 240,
+    speed: 240,
     basicName: "Замах клюшкой",
-    basicDesc: "Мощный удар по дуге перед собой",
+    basicDesc: "Медленный, но сокрушительный удар по дуге",
     themeColor: "#7ec8ff",
-    q: { name: "Силовой бросок", keyLabel: "Q", cooldown: 5, desc: "Щелчок: шайба пробивает врагов насквозь" },
-    e: { name: "Силовой приём", keyLabel: "E", cooldown: 7, desc: "Рывок вперёд, враги на пути отлетают" },
-    r: { name: "Шайбоград", keyLabel: "R", cooldown: 22, desc: "14 взрывных шайб во все стороны" },
-    ult: SATORU,
+    q: { name: "Ледяной прорыв", keyLabel: "Q", cooldown: 8, desc: "Несётся на коньках через карту, под коньками лёд, сминая всех на пути" },
+    e: { name: "Конусный замах", keyLabel: "E", cooldown: 6, desc: "Удар клюшкой широким конусом, задевает толпу" },
+    r: { name: "Замбони", keyLabel: "R", cooldown: 25, desc: "10 секунд давит врагов на льдоуборочной машине" },
+    ult: { name: "ЯРОСТЬ ХОККЕИСТА", keyLabel: "T", cooldown: 45, desc: "10 секунд: сила, скорость и размер растут, атаки быстрее" },
   },
   {
     id: "maxim",
     name: "Максим",
-    title: "Шиноби Одинцова",
+    title: "Маг • Шиноби Одинцова",
     face: "faces/maxim.png",
     mapId: "odintsovo",
     mapName: "Улицы Одинцова",
     cloth: "#f5f5f5",
     accent: "#ff7a1a",
-    weaponName: "Техники Наруто",
+    weaponName: "Чакра",
     hp: 115,
-    speed: 290,
-    basicName: "Бросок сюрикена",
-    basicDesc: "Быстрый сюрикен в точку прицела",
+    speed: 280,
+    basicName: "Сгусток чакры",
+    basicDesc: "Магическая сфера, маленький взрыв при попадании",
     themeColor: "#ffa03a",
-    q: { name: "Расенган", keyLabel: "Q", cooldown: 6, desc: "Сфера чакры: взрыв вокруг и отброс врагов" },
-    e: { name: "Чидори", keyLabel: "E", cooldown: 7, desc: "Молниеносный рывок сквозь врагов" },
-    r: { name: "Расен-сюрикен", keyLabel: "R", cooldown: 24, desc: "Гигантская сфера летит в цель и взрывается" },
-    ult: SATORU,
+    q: { name: "Катон: Огненный шар", keyLabel: "Q", cooldown: 7, desc: "Огненный конус перед собой, поджигает врагов" },
+    e: { name: "Призыв: Жаба", keyLabel: "E", cooldown: 25, desc: "10 секунд давит врагов гигантской жабой" },
+    r: { name: "Теневой клон", keyLabel: "R", cooldown: 20, desc: "Клон 12 секунд сам дерётся с врагами" },
+    ult: { name: "БОЛЬШОЙ РАСЕНГАН", keyLabel: "T", cooldown: 30, desc: "Гигантская сфера чакры летит в цель и взрывается" },
   },
   {
     id: "dasha",
     name: "Даша",
-    title: "Стрелок Закрытой школы",
+    title: "Разбойница • Стрелок Закрытой школы",
     face: "faces/dasha.png",
     mapId: "school",
     mapName: "«Закрытая школа», пансион «Логос»",
     cloth: "#23232a",
     accent: "#c9a15a",
-    weaponName: "Пистолет",
-    hp: 105,
-    speed: 285,
-    basicName: "Выстрел",
-    basicDesc: "Скорострельный пистолет",
+    weaponName: "Пистолеты",
+    hp: 125,
+    speed: 300,
+    basicName: "Два пистолета",
+    basicDesc: "Высокая скорострельность, малый урон пули",
     themeColor: "#ffd24a",
-    q: { name: "Веерный огонь", keyLabel: "Q", cooldown: 5, desc: "5 пуль веером по площади" },
-    e: { name: "Боевой перекат", keyLabel: "E", cooldown: 6, desc: "Перекат с неуязвимостью и ускорением" },
-    r: { name: "Тотальный отстрел", keyLabel: "R", cooldown: 22, desc: "Три залпа пуль по кругу" },
-    ult: SATORU,
+    q: { name: "Дробовик", keyLabel: "Q", cooldown: 6, desc: "Выстрел дробью широким конусом с отбросом" },
+    e: { name: "Крутящийся стрелок", keyLabel: "E", cooldown: 18, desc: "6 секунд стреляет во все стороны, вращаясь" },
+    r: { name: "Бэтмобиль", keyLabel: "R", cooldown: 25, desc: "10 секунд давит врагов бэтмобилем" },
+    ult: { name: "СЕЙСМИЧЕСКИЙ ПРЫЖОК", keyLabel: "T", cooldown: 28, desc: "Прыжок в точку прицела и удар по земле со взрывными волнами" },
   },
   {
     id: "vika",
@@ -144,14 +145,14 @@ export const HEROES: HeroDef[] = [
     accent: "#8a5fd4",
     weaponName: "Волшебная палочка",
     hp: 105,
-    speed: 270,
+    speed: 265,
     basicName: "Магический болт",
     basicDesc: "Сгусток магии из палочки",
     themeColor: "#b58cff",
-    q: { name: "Экспеллиармус", keyLabel: "Q", cooldown: 6, desc: "Луч: обезоруживает и замедляет врагов" },
-    e: { name: "Протего", keyLabel: "E", cooldown: 10, desc: "Щит, блокирующий весь урон 3 секунды" },
-    r: { name: "Волна Авады", keyLabel: "R", cooldown: 26, desc: "Зелёная волна смерти расходится от героини" },
-    ult: SATORU,
+    q: { name: "Империус", keyLabel: "Q", cooldown: 15, desc: "Подчиняет врага (кроме босса) — он 8 секунд дерётся за тебя" },
+    e: { name: "Инсендио", keyLabel: "E", cooldown: 7, desc: "Конус пламени из палочки, поджигает врагов" },
+    r: { name: "Гиппогриф", keyLabel: "R", cooldown: 25, desc: "10 секунд давит врагов на гиппогрифе" },
+    ult: { name: "ОГНЕННЫЙ ДРАКОН", keyLabel: "T", cooldown: 40, desc: "Дракон 5 секунд летает по полю и испепеляет всё вокруг" },
   },
 ];
 

@@ -28,14 +28,20 @@ export interface SnapPlayer {
   h: string; x: number; y: number; fx: number; wk: number; mv: boolean;
   hp: number; mh: number; mn: number; lv: number; dm: number;
   sw: number; sh: number; da: number; al: boolean;
+  /** Маунт, ярость, кручение — для визуала и скорости на клиенте. */
+  mo: number; rg: number; spn: number;
+  cb: number; cq: number; ce: number; cr: number; ct: number; cf: number;
 }
-export interface SnapEnemy { i: number; k: number; s: number; x: number; y: number; hp: number; mhp: number; b: boolean; w: boolean }
+export interface SnapEnemy { i: number; k: number; s: number; x: number; y: number; hp: number; mhp: number; b: boolean; w: boolean; c: boolean }
 export interface SnapProj { i: number; k: string; x: number; y: number; vx: number; vy: number; r: number; c: string; f: boolean }
 export interface SnapSatoru { p: string; x: number; y: number; l: number }
+export interface SnapClone { x: number; y: number; wk: number }
+export interface SnapDragon { x: number; y: number; ang: number }
 export interface SnapMsg {
   t: number; wave: number; kills: number;
   pl: Record<string, SnapPlayer>;
   en: SnapEnemy[]; pr: SnapProj[]; orb: number[][]; sat: SnapSatoru[];
+  cl: SnapClone[]; dr: SnapDragon[];
 }
 
 export type EvMsg =

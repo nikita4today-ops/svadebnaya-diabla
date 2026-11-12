@@ -1,14 +1,14 @@
 /**
  * arpg.ts — «Свадебная Диабла»: изометрический hack-and-slash на 2D-canvas.
  * Четыре героя, четыре тематические локации, волны каждые 30 секунд,
- * боссы каждые 90 секунд, прокачка урона за убийства и кот САТОРУ на ульте.
+ * боссы каждые 90 секунд, прокачка урона за убийства и кот САТОРУ на клавише F.
  */
 
 import { GameLoop } from "./engine";
 import { Input } from "./input";
 import { AudioSystem } from "./audio";
 import {
-  HEROES, MAPS, WORLD_SIZE, XP_BASE, WAVE_PERIOD, BOSS_PERIOD, SATORU_DURATION,
+  HEROES, MAPS, WORLD_SIZE, XP_BASE, WAVE_PERIOD, BOSS_PERIOD, SATORU, SATORU_DURATION,
   ALL_ENEMY_KINDS, COOP_BOSSES, COOP_MAP, kindSprite,
 } from "./heroes";
 import type { HeroDef, EnemyKindDef, MapDef } from "./heroes";
@@ -48,6 +48,10 @@ interface Enemy {
   anim: number; sprite: string;
   /** Замах перед ударом: >0 — идёт телеграф атаки, урон при достижении 0. */
   windup: number;
+  /** Империус (Вика): враг временно сражается за героев. */
+  charmT: number; charmOwner?: PlayerEnt;
+  /** Поджог (Катон/Инсендио/дракон): урон раз в 0.5 с. */
+  burnT: number; burnAcc: number; burnDmg: number; burnOwner?: PlayerEnt;
   /** Сетевой id (кооп): назначает хост, по нему клиент сверяет снапшоты. */
   nid?: number;
   /** Цель интерполяции на клиенте. */
@@ -66,6 +70,15 @@ interface PlayerEnt {
   cdBasic: number; cdQ: number; cdE: number; cdR: number; cdT: number;
   dashT: number; dashDx: number; dashDy: number; dashDmgMul: number; dashHits: Set<Enemy>;
   iframes: number; shieldT: number; speedBuffT: number; swingT: number; hurtFlash: number;
+  /** Ярость хоккеиста (Никита, T): усиление на время. */
+  rageT: number;
+  /** Крутящийся стрелок (Даша, E). */
+  spinT: number; spinAng: number; spinFireT: number;
+  /** Маунт (замбони/жаба/бэтмобиль/гиппогриф, R): оставшееся время и тик урона. */
+  mountT: number; mountDmgT: number;
+  /** Сейсмический прыжок (Даша, T). */
+  leapT: number; leapFromX: number; leapFromY: number; leapToX: number; leapToY: number;
+  cdF: number; // Зов САТОРУ
   alive: boolean;
   /** Цель интерполяции для удалённых игроков. */
   tx: number; ty: number;
@@ -82,6 +95,8 @@ function makePlayer(pid: string, hero: HeroDef, isLocal: boolean): PlayerEnt {
     cdBasic: 0, cdQ: 0, cdE: 0, cdR: 0, cdT: 0,
     dashT: 0, dashDx: 0, dashDy: 0, dashDmgMul: 0, dashHits: new Set(),
     iframes: 0, shieldT: 0, speedBuffT: 0, swingT: 0, hurtFlash: 0,
+    rageT: 0, spinT: 0, spinAng: 0, spinFireT: 0, mountT: 0, mountDmgT: 0,
+    leapT: 0, leapFromX: 0, leapFromY: 0, leapToX: 0, leapToY: 0, cdF: 0,
     alive: true, tx: WORLD_SIZE / 2, ty: WORLD_SIZE / 2, trail: [],
   };
 }
@@ -113,6 +128,12 @@ interface TempLight { x: number; y: number; r: number; life: number; maxLife: nu
 interface Volley { t: number; ang0: number; p: PlayerEnt }
 /** Кот САТОРУ (в коопе может быть несколько — по одному на игрока). */
 interface SatoruEnt { x: number; y: number; life: number; swipeCd: number; pid: string }
+/** Теневой клон Максима: сам ищет врагов и стреляет сюрикенами. */
+interface CloneEnt { x: number; y: number; t: number; shootT: number; walk: number; owner: PlayerEnt; nid?: number }
+/** Огненный дракон Вики: летает вокруг хозяйки и жжёт область. */
+interface DragonEnt { x: number; y: number; t: number; ang: number; tickT: number; owner: PlayerEnt }
+/** Вспышка конусной атаки (Катон, Инсендио, дробовик, замах). */
+interface ConeFx { x: number; y: number; dir: number; half: number; range: number; life: number; maxLife: number; color: string }
 
 const BEST_KEY = "svadebnaya-diabla.best.v1";
 type BestMap = Partial<Record<string, { time: number; kills: number; level: number }>>;
@@ -216,6 +237,10 @@ export class Arpg {
   private get speedBuffT(): number { return this.me.speedBuffT; } private set speedBuffT(v: number) { this.me.speedBuffT = v; }
   private get swingT(): number { return this.me.swingT; } private set swingT(v: number) { this.me.swingT = v; }
   private get hurtFlash(): number { return this.me.hurtFlash; } private set hurtFlash(v: number) { this.me.hurtFlash = v; }
+  private get rageT(): number { return this.me.rageT; } private set rageT(v: number) { this.me.rageT = v; }
+  private get spinT(): number { return this.me.spinT; } private set spinT(v: number) { this.me.spinT = v; }
+  private get mountT(): number { return this.me.mountT; } private set mountT(v: number) { this.me.mountT = v; }
+  private get cdF(): number { return this.me.cdF; } private set cdF(v: number) { this.me.cdF = v; }
 
   // декали (кровь/следы) и слой освещения
   private decals: Array<{ x: number; y: number; r: number; color: string; alpha: number }> = [];
@@ -238,6 +263,9 @@ export class Arpg {
   private spawnT = 0; private nextBossAt = BOSS_PERIOD;
   private bossAlive = false;
   private satorus: SatoruEnt[] = [];
+  private clones: CloneEnt[] = [];
+  private dragons: DragonEnt[] = [];
+  private cones: ConeFx[] = [];
   private shake = 0;
   private overStats = { time: 0, kills: 0, level: 1, wave: 1 };
   private best: BestMap = loadBest();
@@ -637,9 +665,9 @@ export class Arpg {
     // таймеры всех игроков тикают на хосте (и локально у каждого — для отзывчивости)
     for (const p of this.players) {
       if (!p.isLocal && !authority) continue;
-      p.cdBasic -= dt; p.cdQ -= dt; p.cdE -= dt; p.cdR -= dt; p.cdT -= dt;
+      p.cdBasic -= dt; p.cdQ -= dt; p.cdE -= dt; p.cdR -= dt; p.cdT -= dt; p.cdF -= dt;
       p.mana = Math.min(p.maxMana, p.mana + 9 * dt);
-      p.iframes -= dt; p.shieldT -= dt; p.speedBuffT -= dt;
+      p.iframes -= dt; p.shieldT -= dt; p.speedBuffT -= dt; p.rageT -= dt;
       p.swingT -= dt; p.hurtFlash -= dt;
     }
 
@@ -650,9 +678,13 @@ export class Arpg {
     // движение локального игрока (своя позиция авторитетна и в коопе)
     if (this.me.alive) this.updateLocalMovement(dt);
 
-    // удалённые игроки: дэш-урон на хосте, следы на клиенте
+    // удалённые игроки: дэш-урон и приземление прыжка на хосте, следы на клиенте
     for (const p of this.players) {
       if (p.isLocal || !p.alive) continue;
+      if (authority && p.leapT > 0) {
+        p.leapT -= dt;
+        if (p.leapT <= 0) this.leapLand(p);
+      }
       if (authority && p.dashT > 0) {
         p.dashT -= dt;
         if (p.dashDmgMul > 0) {
@@ -674,11 +706,12 @@ export class Arpg {
 
     // атаки локального игрока
     if (this.me.alive) {
-      if (this.mouseDown && this.cdBasic <= 0 && this.dashT <= 0) this.tryCast("basic");
+      if (this.mouseDown && this.cdBasic <= 0 && this.dashT <= 0 && this.me.leapT <= 0) this.tryCast("basic");
       if (this.input.consumeAction("KeyQ") && this.cdQ <= 0) this.tryCast("q");
       if (this.input.consumeAction("KeyE") && this.cdE <= 0) this.tryCast("e");
       if (this.input.consumeAction("KeyR") && this.cdR <= 0) this.tryCast("r");
-      if ((this.input.consumeAction("KeyT") || this.input.consumeAction("KeyF")) && this.cdT <= 0) this.tryCast("t");
+      if (this.input.consumeAction("KeyT") && this.cdT <= 0) this.tryCast("t");
+      if (this.input.consumeAction("KeyF") && this.cdF <= 0) this.tryCast("f");
     }
 
     if (authority) {
@@ -699,6 +732,10 @@ export class Arpg {
       this.updateEnemies(dt);
       this.updateProjs(dt);
       this.updateSatoru(dt);
+      this.updateMounts(dt);
+      this.updateSpin(dt);
+      this.updateClones(dt);
+      this.updateDragons(dt);
 
       // сферы здоровья
       for (let i = this.orbs.length - 1; i >= 0; i--) {
@@ -770,16 +807,33 @@ export class Arpg {
     if (this.netMode === "off" && this.hp <= 0) this.gameOver();
   }
 
-  /** Движение локального игрока: инерция, дэш, границы мира. */
+  /** Движение локального игрока: инерция, дэш, прыжок Даши, маунты, границы мира. */
   private updateLocalMovement(dt: number): void {
-    let sp = this.hero.speed * (this.speedBuffT > 0 ? 1.25 : 1);
+    // сейсмический прыжок Даши: дуга к точке прицела, приземление — взрывные волны
+    if (this.me.leapT > 0) {
+      this.me.leapT -= dt;
+      const t = 1 - Math.max(0, this.me.leapT / 0.38);
+      this.px = this.me.leapFromX + (this.me.leapToX - this.me.leapFromX) * t;
+      this.py = this.me.leapFromY + (this.me.leapToY - this.me.leapFromY) * t;
+      this.walkPhase += dt * 2;
+      this.me.moving = true;
+      if (this.me.leapT <= 0 && this.netMode !== "client") this.leapLand(this.me);
+      this.px = Math.max(40, Math.min(WORLD_SIZE - 40, this.px));
+      this.py = Math.max(40, Math.min(WORLD_SIZE - 40, this.py));
+      return;
+    }
+    let sp = this.hero.speed;
+    if (this.speedBuffT > 0) sp *= 1.25;
+    if (this.mountT > 0) sp *= 1.35;
+    if (this.rageT > 0) sp *= 1.4;
+    if (this.spinT > 0) sp *= 0.5;
     let moving = false;
     if (this.dashT > 0) {
       this.dashT -= dt;
       moving = true;
       this.me.trail.push({ x: this.px, y: this.py, life: 0.35 });
       if (this.me.trail.length > 40) this.me.trail.shift();
-      const dsp = this.hero.id === "maxim" ? 1050 : this.hero.id === "nikita" ? 900 : 820;
+      const dsp = this.hero.id === "maxim" ? 1050 : this.hero.id === "nikita" ? 1400 : 820;
       this.px += this.dashDx * dsp * dt;
       this.py += this.dashDy * dsp * dt;
       this.pvx = this.dashDx * dsp; this.pvy = this.dashDy * dsp;
@@ -787,13 +841,19 @@ export class Arpg {
         for (const e of this.enemies) {
           if (this.dashHits.has(e)) continue;
           const d = Math.hypot(e.x - this.px, e.y - this.py);
-          if (d < e.radius + 30) {
+          if (d < e.radius + 34) {
             this.dashHits.add(e);
-            this.damageEnemy(e, this.basicDmg(this.me) * this.dashDmgMul, this.dashDx * 320, this.dashDy * 320, this.me);
+            this.damageEnemy(e, this.basicDmg(this.me) * this.dashDmgMul, this.dashDx * 340, this.dashDy * 340, this.me);
           }
         }
       }
       if (this.hero.id === "maxim") this.spawnParticles(this.px, this.py, 2, "#9fd8ff", 120);
+      if (this.hero.id === "nikita") {
+        // ледяной след под коньками
+        this.decals.push({ x: this.px, y: this.py + 10, r: 16, color: "#9fd4f0", alpha: 0.35 });
+        if (this.decals.length > 250) this.decals.shift();
+        this.spawnParticles(this.px, this.py, 2, "#cfeaff", 100);
+      }
     } else {
       const ix = this.input.moveX, iz = this.input.moveZ;
       const len = Math.hypot(ix, iz) || 1;
@@ -815,12 +875,36 @@ export class Arpg {
   }
 
   /** Локальная попытка каста: на клиенте уходит хосту, иначе исполняется сразу. */
-  private tryCast(k: "basic" | "q" | "e" | "r" | "t"): void {
+  private tryCast(k: "basic" | "q" | "e" | "r" | "t" | "f"): void {
     if (this.netMode === "client") {
       if (!this.net || !this.hostPeerId) return;
+      const cost = { basic: 0, q: 30, e: 25, r: 60, t: 80, f: 0 }[k];
+      if (this.mana < cost) {
+        this.floaters.push({ x: this.px, y: this.py - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+        return;
+      }
       this.net.sendCast({ k, dir: this.facing }, this.hostPeerId);
       this.swingT = 0.18; // мгновенный отклик анимации; урон посчитает хост
-      if (k === "basic") this.cdBasic = 0.25;
+      // оптимистичный кулдаун — снапшот хоста поправит
+      const cdMap = { basic: 0.25, q: this.hero.q.cooldown, e: this.hero.e.cooldown, r: this.hero.r.cooldown, t: this.hero.ult.cooldown, f: SATORU.cooldown };
+      if (k === "basic") this.cdBasic = cdMap.basic;
+      else if (k === "q") this.cdQ = cdMap.q;
+      else if (k === "e") this.cdE = cdMap.e;
+      else if (k === "r") this.cdR = cdMap.r;
+      else if (k === "t") this.cdT = cdMap.t;
+      else this.cdF = cdMap.f;
+      // предсказание движения для рывков/прыжков (позиция — наша, клиентская)
+      if (k === "q" && this.hero.id === "nikita") {
+        this.dashT = 0.5; this.dashDx = Math.cos(this.facing); this.dashDy = Math.sin(this.facing);
+        this.dashDmgMul = 0; // урон начислит хост
+      }
+      if (k === "t" && this.hero.id === "dasha") {
+        const dist = 380;
+        this.me.leapT = 0.38;
+        this.me.leapFromX = this.px; this.me.leapFromY = this.py;
+        this.me.leapToX = Math.max(40, Math.min(WORLD_SIZE - 40, this.px + Math.cos(this.facing) * dist));
+        this.me.leapToY = Math.max(40, Math.min(WORLD_SIZE - 40, this.py + Math.sin(this.facing) * dist));
+      }
       return;
     }
     this.executeCast(this.me, k, this.facing);
@@ -828,16 +912,17 @@ export class Arpg {
 
   /** Выполнение способности игрока p (на хосте/в соло). */
   private executeCast(p: PlayerEnt, k: string, dir: number): void {
-    const before = { q: p.cdQ, e: p.cdE, r: p.cdR, t: p.cdT };
+    const before = { q: p.cdQ, e: p.cdE, r: p.cdR, t: p.cdT, f: p.cdF };
     if (k === "basic") this.basicAttack(p, dir);
     else if (k === "q") this.castQ(p, dir);
     else if (k === "e") this.castE(p, dir);
     else if (k === "r") this.castR(p, dir);
-    else if (k === "t") this.castSatoru(p);
+    else if (k === "t") this.castUlt(p, dir);
+    else if (k === "f") this.castSatoru(p);
     // визуал для остальных клиентов
     if (this.netMode === "host" && k !== "basic") {
       const fired = (k === "q" && p.cdQ !== before.q) || (k === "e" && p.cdE !== before.e)
-        || (k === "r" && p.cdR !== before.r) || (k === "t" && p.cdT !== before.t);
+        || (k === "r" && p.cdR !== before.r) || (k === "t" && p.cdT !== before.t) || (k === "f" && p.cdF !== before.f);
       if (fired) this.net?.sendEv({ t: "castfx", h: p.hero.id, k, x: p.x, y: p.y, dir });
     }
   }
@@ -845,17 +930,13 @@ export class Arpg {
   /** Экран выбора героя: соло, создание лобби, вход по коду. */
   private updateSelect(): void {
     if (this.selScreen === "join") {
-      for (let i = 0; i < 26; i++) {
-        const code = `Key${String.fromCharCode(65 + i)}`;
-        if (this.input.consumeAction(code) && this.joinCode.length < 5) { this.joinCode += String.fromCharCode(65 + i); this.audio.sfx("ui"); }
-      }
-      for (let i = 0; i <= 9; i++) {
-        if (this.input.consumeAction(`Digit${i}`) && this.joinCode.length < 5) { this.joinCode += String(i); this.audio.sfx("ui"); }
-      }
-      if (this.input.consumeAction("Backspace")) { this.joinCode = this.joinCode.slice(0, -1); this.audio.sfx("ui"); }
-      if (this.input.consumeAction("Escape")) { this.selScreen = "heroes"; this.lobbyError = ""; this.audio.sfx("ui"); }
-      if ((this.input.consumeAction("Enter") || this.input.consumeAction("NumpadEnter")) && this.joinCode.length === 5) {
-        this.joinLobby(this.joinCode);
+      // важен порядок нажатий: две буквы в одном кадре не должны переставляться
+      for (const code of this.input.drainPresses()) {
+        if (/^Key[A-Z]$/.test(code) && this.joinCode.length < 5) { this.joinCode += code[3]; this.audio.sfx("ui"); }
+        else if (/^Digit[0-9]$/.test(code) && this.joinCode.length < 5) { this.joinCode += code[5]; this.audio.sfx("ui"); }
+        else if (code === "Backspace") { this.joinCode = this.joinCode.slice(0, -1); this.audio.sfx("ui"); }
+        else if (code === "Escape") { this.selScreen = "heroes"; this.lobbyError = ""; this.audio.sfx("ui"); }
+        else if ((code === "Enter" || code === "NumpadEnter") && this.joinCode.length === 5) this.joinLobby(this.joinCode);
       }
       return;
     }
@@ -868,12 +949,33 @@ export class Arpg {
       this.startRun(HEROES[this.selIndex]);
     }
     if (this.input.consumeAction("KeyC")) { this.createLobby(); }
-    if (this.input.consumeAction("KeyJ")) { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; this.audio.sfx("ui"); }
+    if (this.input.consumeAction("KeyJ")) { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; this.input.drainPresses(); this.audio.sfx("ui"); }
   }
 
   private basicDmg(p: PlayerEnt): number {
-    const base = { nikita: 26, maxim: 16, dasha: 14, vika: 18 }[p.hero.id];
-    return base * p.dmgMul;
+    const base = { nikita: 40, maxim: 18, dasha: 9, vika: 18 }[p.hero.id];
+    return base * p.dmgMul * (p.hero.id === "nikita" && p.rageT > 0 ? 1.8 : 1);
+  }
+
+  /** Урон конусом перед игроком: Катон, Инсендио, конусный замах. */
+  private coneHit(p: PlayerEnt, dir: number, range: number, half: number, dmgMul: number, knock: number, color: string, burnDmg = 0): void {
+    let hits = 0;
+    for (const e of this.enemies) {
+      if (e.charmT > 0) continue;
+      const d = Math.hypot(e.x - p.x, e.y - p.y);
+      if (d > range + e.radius) continue;
+      const ang = Math.atan2(e.y - p.y, e.x - p.x);
+      let diff = ang - dir;
+      while (diff > Math.PI) diff -= 2 * Math.PI;
+      while (diff < -Math.PI) diff += 2 * Math.PI;
+      if (Math.abs(diff) < half) {
+        this.damageEnemy(e, this.basicDmg(p) * dmgMul, Math.cos(ang) * knock, Math.sin(ang) * knock, p);
+        if (burnDmg > 0) { e.burnT = 3; e.burnDmg = burnDmg; e.burnAcc = 0; e.burnOwner = p; }
+        hits++;
+      }
+    }
+    this.cones.push({ x: p.x, y: p.y, dir, half, range, life: 0.28, maxLife: 0.28, color });
+    if (hits > 0) this.addLight(p.x + Math.cos(dir) * range * 0.5, p.y + Math.sin(dir) * range * 0.5, range, 0.3);
   }
 
   /** Ближайший живой игрок к точке (цель для врагов и сфер). */
@@ -890,25 +992,26 @@ export class Arpg {
 
   private basicAttack(p: PlayerEnt, dir: number): void {
     if (p.hero.id === "nikita") {
-      p.cdBasic = 0.42;
-      p.swingT = 0.18;
+      p.cdBasic = 0.55 * (p.rageT > 0 ? 0.6 : 1);
+      p.swingT = 0.2;
       let hit = false;
       for (const e of this.enemies) {
+        if (e.charmT > 0) continue;
         const d = Math.hypot(e.x - p.x, e.y - p.y);
         const ang = Math.atan2(e.y - p.y, e.x - p.x);
         let diff = ang - dir;
         while (diff > Math.PI) diff -= 2 * Math.PI;
         while (diff < -Math.PI) diff += 2 * Math.PI;
-        if (d < 95 + e.radius && Math.abs(diff) < 0.95) {
-          this.damageEnemy(e, this.basicDmg(p), Math.cos(ang) * 220, Math.sin(ang) * 220, p);
+        if (d < 115 + e.radius && Math.abs(diff) < 1.1) {
+          this.damageEnemy(e, this.basicDmg(p), Math.cos(ang) * 260, Math.sin(ang) * 260, p);
           hit = true;
         }
       }
       if (p.isLocal) this.audio.sfx(hit ? "hit" : "move");
     } else {
       const spec = {
-        maxim: { sp: 720, r: 7, cd: 0.32, color: "#d8e2e8", kind: "shuriken" },
-        dasha: { sp: 950, r: 4, cd: 0.2, color: "#ffd24a", kind: "bullet" },
+        maxim: { sp: 640, r: 10, cd: 0.4, color: "#8fd0ff", kind: "chakra" },
+        dasha: { sp: 980, r: 4, cd: 0.14, color: "#ffd24a", kind: "bullet" },
         vika: { sp: 660, r: 8, cd: 0.38, color: "#b58cff", kind: "bolt" },
       }[p.hero.id];
       p.cdBasic = spec.cd;
@@ -930,52 +1033,60 @@ export class Arpg {
     }
     p.mana -= 30;
     if (p.hero.id === "nikita") {
+      // Ледяной прорыв: долгий рывок на коньках сквозь толпу
       p.cdQ = p.hero.q.cooldown;
-      this.projs.push({
-        x: p.x + Math.cos(dir) * 30, y: p.y + Math.sin(dir) * 30,
-        vx: Math.cos(dir) * 1050, vy: Math.sin(dir) * 1050,
-        dmg: this.basicDmg(p) * 3, r: 9, friendly: true, pierce: true,
-        life: 1.1, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(), owner: p,
-      });
-      this.shake = Math.min(14, this.shake + 6);
+      p.dashT = 0.5; p.dashDx = Math.cos(dir); p.dashDy = Math.sin(dir);
+      p.dashDmgMul = 2.5; p.dashHits = new Set();
+      p.swingT = 0.2;
       this.audio.sfx("explosion");
     } else if (p.hero.id === "maxim") {
+      // Катон: огненный конус с поджогом
       p.cdQ = p.hero.q.cooldown;
       p.swingT = 0.25;
-      for (const e of this.enemies) {
-        const d = Math.hypot(e.x - p.x, e.y - p.y);
-        if (d < 150 + e.radius) {
-          const ang = Math.atan2(e.y - p.y, e.x - p.x);
-          this.damageEnemy(e, this.basicDmg(p) * 2.6, Math.cos(ang) * 380, Math.sin(ang) * 380, p);
-        }
-      }
-      this.spawnParticles(p.x, p.y, 36, "#7ec8ff", 380);
-      this.spawnParticles(p.x, p.y, 16, "#ffffff", 260);
-      this.spawnWave(p.x, p.y, 190, "#7ec8ff", 0, 20, 0.4);
-      this.addLight(p.x, p.y, 260, 0.25);
-      this.shake = Math.min(14, this.shake + 8);
+      this.coneHit(p, dir, 270, 0.62, 2.8, 200, "#ff7a3c", this.basicDmg(p) * 0.7);
+      this.spawnParticles(p.x + Math.cos(dir) * 90, p.y + Math.sin(dir) * 90, 22, "#ff9a3c", 300);
       this.audio.sfx("explosion");
     } else if (p.hero.id === "dasha") {
+      // Дробовик: 8 дробин широким конусом
       p.cdQ = p.hero.q.cooldown;
-      for (let i = -2; i <= 2; i++) {
-        const a = dir + i * 0.22;
+      p.swingT = 0.2;
+      for (let i = 0; i < 8; i++) {
+        const a = dir + (Math.random() - 0.5) * 0.9;
         this.projs.push({
           x: p.x + Math.cos(a) * 26, y: p.y + Math.sin(a) * 26,
-          vx: Math.cos(a) * 880, vy: Math.sin(a) * 880,
-          dmg: this.basicDmg(p) * 0.9, r: 4, friendly: true, pierce: false,
-          life: 0.7, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null, owner: p,
+          vx: Math.cos(a) * 820, vy: Math.sin(a) * 820,
+          dmg: this.basicDmg(p) * 0.9, r: 5, friendly: true, pierce: false,
+          life: 0.34, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null, owner: p,
         });
       }
+      this.cones.push({ x: p.x, y: p.y, dir, half: 0.5, range: 120, life: 0.18, maxLife: 0.18, color: "#ffd24a" });
+      this.shake = Math.min(14, this.shake + 5);
       this.audio.sfx("hit");
     } else {
+      // Империус: ближайший к прицелу враг (не босс) переходит на сторону героев
+      const aimX = p.x + Math.cos(dir) * 320, aimY = p.y + Math.sin(dir) * 320;
+      let target: Enemy | null = null;
+      let bd = 200;
+      for (const e of this.enemies) {
+        if (e.boss || e.charmT > 0) continue;
+        if (Math.hypot(e.x - p.x, e.y - p.y) > 430) continue;
+        const d = Math.hypot(e.x - aimX, e.y - aimY);
+        if (d < bd) { bd = d; target = e; }
+      }
+      if (!target) {
+        if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ ЦЕЛИ", color: "#b58cff", life: 0.7 });
+        p.mana += 30; // не тратим ману впустую
+        return;
+      }
       p.cdQ = p.hero.q.cooldown;
-      this.projs.push({
-        x: p.x + Math.cos(dir) * 26, y: p.y + Math.sin(dir) * 26,
-        vx: Math.cos(dir) * 820, vy: Math.sin(dir) * 820,
-        dmg: this.basicDmg(p) * 2, r: 14, friendly: true, pierce: true,
-        life: 0.9, color: "#ff5252", kind: "expelliarmus", disarm: true, hitSet: new Set(), owner: p,
-      });
-      this.audio.sfx("ui");
+      p.swingT = 0.25;
+      target.charmT = 8;
+      target.charmOwner = p;
+      target.windup = 0;
+      this.spawnParticles(target.x, target.y - 20, 20, "#3ddc84", 220);
+      this.spawnWave(target.x, target.y, 90, "#3ddc84", 0, 14, 0.4);
+      this.floaters.push({ x: target.x, y: target.y - 40, text: "ИМПЕРИУС!", color: "#3ddc84", life: 1 });
+      this.audio.sfx("win");
     }
   }
 
@@ -986,34 +1097,122 @@ export class Arpg {
     }
     p.mana -= 25;
     if (p.hero.id === "nikita") {
+      // Конусный замах клюшкой
       p.cdE = p.hero.e.cooldown;
-      p.dashT = 0.24; p.dashDx = Math.cos(dir); p.dashDy = Math.sin(dir);
-      p.dashDmgMul = 1.6; p.dashHits = new Set();
+      p.swingT = 0.28;
+      this.coneHit(p, dir, 185, 0.75, 3.0, 520, "#cfeaff");
+      this.shake = Math.min(14, this.shake + 6);
       this.audio.sfx("hit");
     } else if (p.hero.id === "maxim") {
+      // Призыв: жаба — маунт-давилка на 10 секунд
       p.cdE = p.hero.e.cooldown;
-      p.dashT = 0.28; p.dashDx = Math.cos(dir); p.dashDy = Math.sin(dir);
-      p.dashDmgMul = 2.2; p.dashHits = new Set();
+      p.mountT = 10; p.mountDmgT = 0;
+      this.spawnWave(p.x, p.y, 160, "#7ab54a", 0, 20, 0.5);
+      this.addLight(p.x, p.y, 240, 0.3);
       this.audio.sfx("explosion");
     } else if (p.hero.id === "dasha") {
+      // Крутящийся стрелок: 6 секунд огня во все стороны
       p.cdE = p.hero.e.cooldown;
-      const ix = p.isLocal ? this.input.moveX : 0, iz = p.isLocal ? this.input.moveZ : 0;
-      const has = Math.abs(ix) + Math.abs(iz) > 0;
-      const dx = has ? ix / (Math.hypot(ix, iz) || 1) : Math.cos(dir);
-      const dy = has ? -iz / (Math.hypot(ix, iz) || 1) : Math.sin(dir);
-      p.dashT = 0.25; p.dashDx = dx; p.dashDy = dy; p.dashDmgMul = 0;
-      p.iframes = 0.6; p.speedBuffT = 2;
-      this.audio.sfx("ui");
+      p.spinT = 6; p.spinAng = dir; p.spinFireT = 0;
+      this.audio.sfx("hit");
     } else {
+      // Инсендио: конус пламени из палочки
       p.cdE = p.hero.e.cooldown;
-      p.shieldT = 3;
-      this.spawnParticles(p.x, p.y, 20, "#b58cff", 180);
-      this.audio.sfx("win");
+      p.swingT = 0.25;
+      this.coneHit(p, dir, 250, 0.55, 2.6, 160, "#ff9a3c", this.basicDmg(p) * 0.6);
+      this.spawnParticles(p.x + Math.cos(dir) * 80, p.y + Math.sin(dir) * 80, 20, "#ff8a3c", 280);
+      this.audio.sfx("explosion");
     }
   }
 
-  private castSatoru(p: PlayerEnt): void {
+  private castR(p: PlayerEnt, dir: number): void {
+    if (p.mana < 60) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+      return;
+    }
+    p.mana -= 60;
+    p.cdR = p.hero.r.cooldown;
+    p.swingT = 0.3;
+    if (p.hero.id === "nikita" || p.hero.id === "dasha" || p.hero.id === "vika") {
+      // Замбони / Бэтмобиль / Гиппогриф: маунт-давилка на 10 секунд
+      p.mountT = 10; p.mountDmgT = 0;
+      const color = { nikita: "#7ec8ff", dasha: "#3a3a42", vika: "#c9b18a" }[p.hero.id];
+      this.spawnWave(p.x, p.y, 180, color, 0, 22, 0.5);
+      this.addLight(p.x, p.y, 300, 0.35);
+      this.audio.sfx("explosion");
+    } else {
+      // Теневой клон Максима
+      this.clones.push({
+        x: p.x + Math.cos(dir + 1.6) * 60, y: p.y + Math.sin(dir + 1.6) * 60,
+        t: 12, shootT: 0.3, walk: 0, owner: p, nid: this.nidSeq++,
+      });
+      this.spawnParticles(p.x, p.y, 30, "#9fd8ff", 300);
+      this.addLight(p.x, p.y, 260, 0.3);
+      this.audio.sfx("win");
+    }
+    void dir;
+  }
+
+  /** Ультимейт героя (клавиша T). */
+  private castUlt(p: PlayerEnt, dir: number): void {
+    if (p.mana < 80) {
+      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+      return;
+    }
+    p.mana -= 80;
     p.cdT = p.hero.ult.cooldown;
+    p.swingT = 0.35;
+    if (p.hero.id === "nikita") {
+      // ЯРОСТЬ ХОККЕИСТА: сила, скорость, темп атаки, размер
+      p.rageT = 10;
+      this.spawnWave(p.x, p.y, 260, "#ff5a3c", 0, 26, 0.6);
+      this.spawnParticles(p.x, p.y, 36, "#ff8a5a", 340);
+      this.addLight(p.x, p.y, 360, 0.5);
+      this.shake = Math.min(18, this.shake + 10);
+      if (p.isLocal) this.announce("ЯРОСТЬ ХОККЕИСТА!", "10 секунд неудержимой силы");
+      this.audio.sfx("explosion");
+    } else if (p.hero.id === "maxim") {
+      // Большой расенган: гигантская сфера в прицел
+      this.projs.push({
+        x: p.x + Math.cos(dir) * 44, y: p.y + Math.sin(dir) * 44,
+        vx: Math.cos(dir) * 700, vy: Math.sin(dir) * 700,
+        dmg: this.basicDmg(p) * 2.2, r: 34, friendly: true, pierce: true,
+        life: 0.95, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(), owner: p,
+      });
+      this.addLight(p.x, p.y, 300, 0.3);
+      this.audio.sfx("explosion");
+    } else if (p.hero.id === "dasha") {
+      // Сейсмический прыжок в точку прицела
+      const dist = Math.min(380, Math.hypot(Math.cos(dir) * 400, Math.sin(dir) * 400));
+      p.leapT = 0.38;
+      p.leapFromX = p.x; p.leapFromY = p.y;
+      p.leapToX = Math.max(40, Math.min(WORLD_SIZE - 40, p.x + Math.cos(dir) * dist));
+      p.leapToY = Math.max(40, Math.min(WORLD_SIZE - 40, p.y + Math.sin(dir) * dist));
+      p.iframes = 0.6;
+      this.audio.sfx("hit");
+    } else {
+      // Огненный дракон: 5 секунд летает и испепеляет
+      this.dragons.push({ x: p.x, y: p.y, t: 5, ang: 0, tickT: 0, owner: p });
+      if (p.isLocal) this.announce("ОГНЕННЫЙ ДРАКОН!", "летит испепелять врагов");
+      this.addLight(p.x, p.y, 400, 0.6);
+      this.audio.sfx("explosion");
+    }
+  }
+
+  /** Приземление Даши после сейсмического прыжка: три взрывные волны. */
+  private leapLand(p: PlayerEnt): void {
+    this.spawnWave(p.x, p.y, 300, "#ffd24a", this.basicDmg(p) * 4, 34, 0.55, p);
+    this.spawnWave(p.x, p.y, 200, "#ffb02e", this.basicDmg(p) * 2, 22, 0.4, p);
+    this.spawnWave(p.x, p.y, 120, "#ffffff", 0, 14, 0.3);
+    this.spawnParticles(p.x, p.y, 40, "#ffd24a", 400);
+    this.addLight(p.x, p.y, 420, 0.5);
+    this.shake = Math.min(22, this.shake + 14);
+    this.audio.sfx("explosion");
+    if (this.netMode === "host") this.net?.sendEv({ t: "boom", x: p.x, y: p.y });
+  }
+
+  private castSatoru(p: PlayerEnt): void {
+    p.cdF = SATORU.cooldown;
     this.satorus = this.satorus.filter((s) => s.pid !== p.pid);
     this.satorus.push({ x: p.x - 60, y: p.y - 60, life: SATORU_DURATION, swipeCd: 0, pid: p.pid });
     if (p.isLocal) {
@@ -1033,55 +1232,6 @@ export class Arpg {
   /** Вспышка света на слое освещения (взрывы, заклинания). */
   private addLight(x: number, y: number, r: number, life = 0.25): void {
     if (this.tempLights.length < 12) this.tempLights.push({ x, y, r, life, maxLife: life });
-  }
-
-  /** Массовый ультимейт (клавиша R) — у каждого героя свой. */
-  private castR(p: PlayerEnt, dir: number): void {
-    if (p.mana < 60) {
-      if (p.isLocal) this.floaters.push({ x: p.x, y: p.y - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
-      return;
-    }
-    p.mana -= 60;
-    p.cdR = p.hero.r.cooldown;
-    p.swingT = 0.3;
-    if (p.hero.id === "nikita") {
-      // «Шайбоград»: 14 взрывных шайб во все стороны
-      for (let k = 0; k < 14; k++) {
-        const a = (k / 14) * Math.PI * 2 + 0.13;
-        this.projs.push({
-          x: p.x + Math.cos(a) * 34, y: p.y + Math.sin(a) * 34,
-          vx: Math.cos(a) * 950, vy: Math.sin(a) * 950,
-          dmg: this.basicDmg(p) * 2.2, r: 9, friendly: true, pierce: true,
-          life: 1.0, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(), owner: p,
-        });
-      }
-      this.spawnWave(p.x, p.y, 240, "#7ec8ff", 0, 22, 0.5);
-      this.addLight(p.x, p.y, 320, 0.3);
-      this.shake = Math.min(18, this.shake + 10);
-      this.audio.sfx("explosion");
-    } else if (p.hero.id === "maxim") {
-      // «Расен-сюрикен»: гигантская сфера летит в точку прицела и взрывается
-      this.projs.push({
-        x: p.x + Math.cos(dir) * 40, y: p.y + Math.sin(dir) * 40,
-        vx: Math.cos(dir) * 780, vy: Math.sin(dir) * 780,
-        dmg: this.basicDmg(p) * 1.4, r: 26, friendly: true, pierce: true,
-        life: 0.85, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(), owner: p,
-      });
-      this.audio.sfx("explosion");
-    } else if (p.hero.id === "dasha") {
-      // «Тотальный отстрел»: три круговых залпа по 16 пуль
-      this.volleys.push({ t: 0, ang0: 0, p }, { t: 0.16, ang0: Math.PI / 16, p }, { t: 0.32, ang0: -Math.PI / 16, p });
-      this.addLight(p.x, p.y, 260, 0.2);
-      this.audio.sfx("hit");
-    } else {
-      // «Волна Авады»: зелёная волна смерти, бьёт всех по пути
-      this.spawnWave(p.x, p.y, 430, "#3ddc84", this.basicDmg(p) * 4.5, 36, 0.7, p);
-      this.spawnWave(p.x, p.y, 300, "#b0ffd0", 0, 18, 0.55);
-      this.spawnParticles(p.x, p.y, 40, "#3ddc84", 380);
-      this.addLight(p.x, p.y, 430, 0.5);
-      this.shake = Math.min(20, this.shake + 12);
-      this.audio.sfx("explosion");
-    }
   }
 
   // ---------- враги ----------
@@ -1110,6 +1260,7 @@ export class Arpg {
         speed: 72, dmg: 20 * this.dmgMulE, radius: 36, xp: 150,
         attackCd: 0, shootCd: 2, burstCd: 4, flash: 0, disarmT: 0, kx: 0, ky: 0,
         anim: 0, sprite, windup: 0, nid: this.nidSeq++,
+        charmT: 0, burnT: 0, burnAcc: 0, burnDmg: 0,
       });
       this.announce(`БОСС: ${name}`, "постарайся выжить!");
       if (this.netMode === "host") this.net?.sendEv({ t: "ann", x: `БОСС: ${name}`, s: "постарайтесь выжить!" });
@@ -1122,6 +1273,7 @@ export class Arpg {
         radius: kind.radius, xp: kind.xp,
         attackCd: 0, shootCd: 1 + Math.random() * 1.5, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
         anim: Math.random() * 10, sprite: this.netMode !== "off" ? kindSprite(kind) : (kind.spriteVar ?? this.enemySpriteId()), windup: 0, nid: this.nidSeq++,
+        charmT: 0, burnT: 0, burnAcc: 0, burnDmg: 0,
       });
     }
   }
@@ -1133,9 +1285,55 @@ export class Arpg {
       if (e.boss) this.bossAlive = true;
       e.flash -= dt; e.attackCd -= dt; e.shootCd -= dt; e.burstCd -= dt; e.disarmT -= dt;
       e.anim += dt * (0.6 + e.speed / 90);
+      // поджог (Катон / Инсендио / дракон): тики урона раз в 0.5 с
+      if (e.burnT > 0) {
+        e.burnT -= dt; e.burnAcc += dt;
+        if (e.burnAcc >= 0.5) {
+          e.burnAcc -= 0.5;
+          this.spawnParticles(e.x, e.y - 10, 3, "#ff8a3c", 120);
+          this.damageEnemy(e, e.burnDmg * 0.5, 0, 0, e.burnOwner);
+          if (e.hp <= 0) continue;
+        }
+      }
       // нокбэк
       e.x += e.kx * dt; e.y += e.ky * dt;
       e.kx *= Math.pow(0.0001, dt); e.ky *= Math.pow(0.0001, dt);
+      // Империус: подчинённый враг дерётся с бывшими союзниками
+      if (e.charmT > 0) {
+        e.charmT -= dt;
+        let tgt2: Enemy | null = null;
+        let bd2 = Infinity;
+        for (const o of this.enemies) {
+          if (o === e || o.charmT > 0) continue;
+          const d2 = (o.x - e.x) * (o.x - e.x) + (o.y - e.y) * (o.y - e.y);
+          if (d2 < bd2) { bd2 = d2; tgt2 = o; }
+        }
+        if (tgt2) {
+          const dx2 = tgt2.x - e.x, dy2 = tgt2.y - e.y;
+          const d2 = Math.hypot(dx2, dy2) || 1;
+          if (e.kind.ranged) {
+            if (d2 > 260) { e.x += (dx2 / d2) * e.speed * dt; e.y += (dy2 / d2) * e.speed * dt; }
+            if (e.shootCd <= 0 && d2 < 520) {
+              e.shootCd = 2.0;
+              this.projs.push({
+                x: e.x, y: e.y, vx: (dx2 / d2) * 380, vy: (dy2 / d2) * 380,
+                dmg: e.dmg * 2, r: 6, friendly: true, pierce: false,
+                life: 1.6, color: "#3ddc84", kind: "enemy", disarm: false, hitSet: null, owner: e.charmOwner,
+              });
+            }
+          } else {
+            if (d2 > e.radius + tgt2.radius + 8) { e.x += (dx2 / d2) * e.speed * dt; e.y += (dy2 / d2) * e.speed * dt; }
+            else if (e.attackCd <= 0) {
+              e.attackCd = 0.8;
+              this.damageEnemy(tgt2, e.dmg * 2, (dx2 / d2) * 200, (dy2 / d2) * 200, e.charmOwner);
+              this.spawnParticles(tgt2.x, tgt2.y, 4, "#3ddc84", 160);
+            }
+          }
+        }
+        e.x = Math.max(30, Math.min(WORLD_SIZE - 30, e.x));
+        e.y = Math.max(30, Math.min(WORLD_SIZE - 30, e.y));
+        continue;
+      }
       const tgt = this.nearestPlayer(e.x, e.y);
       if (!tgt) continue;
       const dx = tgt.x - e.x, dy = tgt.y - e.y;
@@ -1273,11 +1471,16 @@ export class Arpg {
       let dead = p.life <= 0 || p.x < 0 || p.x > WORLD_SIZE || p.y < 0 || p.y > WORLD_SIZE;
       if (!dead && p.friendly) {
         for (const e of this.enemies) {
-          if (p.hitSet?.has(e)) continue;
+          if (e.charmT > 0 || p.hitSet?.has(e)) continue;
           if (Math.hypot(e.x - p.x, e.y - p.y) < e.radius + p.r) {
             if (p.disarm) e.disarmT = 3;
             const ang = Math.atan2(p.vy, p.vx);
             this.damageEnemy(e, p.dmg, Math.cos(ang) * 140, Math.sin(ang) * 140, p.owner);
+            if (p.kind === "chakra") {
+              // сгусток чакры Максима: маленький взрыв при попадании
+              this.spawnWave(p.x, p.y, 70, "#8fd0ff", p.dmg * 0.5, 14, 0.3, p.owner);
+              this.addLight(p.x, p.y, 120, 0.15);
+            }
             if (p.pierce) p.hitSet?.add(e);
             else { dead = true; break; }
           }
@@ -1294,13 +1497,14 @@ export class Arpg {
       }
       if (dead) {
         if (p.kind === "rasenshuriken") {
-          // взрыв Расен-сюрикена: огромная волна чакры
-          this.spawnWave(p.x, p.y, 330, "#7ec8ff", this.basicDmg(p.owner ?? this.me) * 5, 34, 0.55, p.owner);
-          this.spawnWave(p.x, p.y, 210, "#ffffff", 0, 16, 0.4);
+          // взрыв Расенгана: масштаб от размера сферы (ульт больше)
+          const scale = p.r / 26;
+          this.spawnWave(p.x, p.y, 330 * scale, "#7ec8ff", this.basicDmg(p.owner ?? this.me) * 5 * scale, 34, 0.55, p.owner);
+          this.spawnWave(p.x, p.y, 210 * scale, "#ffffff", 0, 16, 0.4);
           this.spawnParticles(p.x, p.y, 36, "#7ec8ff", 420);
           this.spawnParticles(p.x, p.y, 14, "#ffffff", 300);
-          this.addLight(p.x, p.y, 400, 0.4);
-          this.shake = Math.min(20, this.shake + 12);
+          this.addLight(p.x, p.y, 400 * scale, 0.4);
+          this.shake = Math.min(20, this.shake + 12 * scale);
           this.audio.sfx("explosion");
           if (this.netMode === "host") this.net?.sendEv({ t: "boom", x: p.x, y: p.y });
         } else if (p.kind !== "bullet") this.spawnParticles(p.x, p.y, 3, p.color, 120);
@@ -1323,6 +1527,7 @@ export class Arpg {
       let target: Enemy | null = null;
       let best = 950;
       for (const e of this.enemies) {
+        if (e.charmT > 0) continue;
         const d = Math.hypot(e.x - s.x, e.y - s.y);
         if (d < best) { best = d; target = e; }
       }
@@ -1332,6 +1537,7 @@ export class Arpg {
         else if (s.swipeCd <= 0) {
           s.swipeCd = 0.55;
           for (const e of this.enemies) {
+            if (e.charmT > 0) continue;
             if (Math.hypot(e.x - s.x, e.y - s.y) < 78 + e.radius) {
               const ang = Math.atan2(e.y - s.y, e.x - s.x);
               this.damageEnemy(e, this.basicDmg(owner) * 1.6, Math.cos(ang) * 260, Math.sin(ang) * 260, owner);
@@ -1344,6 +1550,112 @@ export class Arpg {
       } else {
         const d = Math.hypot(owner.x - s.x, owner.y - s.y) || 1;
         if (d > 90) { s.x += ((owner.x - s.x) / d) * 380 * dt; s.y += ((owner.y - s.y) / d) * 380 * dt; }
+      }
+    }
+  }
+
+  /** Маунты (замбони/жаба/бэтмобиль/гиппогриф): контактный урон каждые 0.35 с. */
+  private updateMounts(dt: number): void {
+    for (const p of this.players) {
+      if (!p.alive || p.mountT <= 0) continue;
+      p.mountT -= dt;
+      p.mountDmgT -= dt;
+      if (p.mountDmgT > 0) continue;
+      p.mountDmgT = 0.35;
+      for (const e of this.enemies) {
+        if (e.charmT > 0) continue;
+        const d = Math.hypot(e.x - p.x, e.y - p.y);
+        if (d < 60 + e.radius) {
+          const ang = Math.atan2(e.y - p.y, e.x - p.x);
+          this.damageEnemy(e, this.basicDmg(p) * 1.5, Math.cos(ang) * 420, Math.sin(ang) * 420, p);
+        }
+      }
+      this.spawnParticles(p.x, p.y + 12, 2, "#c9c9c9", 90);
+    }
+  }
+
+  /** Крутящийся стрелок Даши: пули по кругу 6 секунд. */
+  private updateSpin(dt: number): void {
+    for (const p of this.players) {
+      if (!p.alive || p.spinT <= 0) continue;
+      p.spinT -= dt;
+      p.spinAng += dt * 8.5;
+      p.spinFireT -= dt;
+      if (p.spinFireT <= 0) {
+        p.spinFireT = 0.13;
+        const a = p.spinAng;
+        this.projs.push({
+          x: p.x + Math.cos(a) * 26, y: p.y + Math.sin(a) * 26,
+          vx: Math.cos(a) * 950, vy: Math.sin(a) * 950,
+          dmg: this.basicDmg(p) * 0.7, r: 4, friendly: true, pierce: false,
+          life: 0.6, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null, owner: p,
+        });
+      }
+    }
+  }
+
+  /** Теневые клоны Максима: держат дистанцию и стреляют сюрикенами. */
+  private updateClones(dt: number): void {
+    for (let i = this.clones.length - 1; i >= 0; i--) {
+      const c = this.clones[i];
+      c.t -= dt; c.shootT -= dt;
+      if (c.t <= 0) {
+        this.spawnParticles(c.x, c.y, 20, "#9fd8ff", 240);
+        this.clones.splice(i, 1);
+        continue;
+      }
+      let target: Enemy | null = null;
+      let bd = 850;
+      for (const e of this.enemies) {
+        if (e.charmT > 0) continue;
+        const d = Math.hypot(e.x - c.x, e.y - c.y);
+        if (d < bd) { bd = d; target = e; }
+      }
+      if (target) {
+        const dx = target.x - c.x, dy = target.y - c.y;
+        const d = bd || 1;
+        if (d > 220) { c.x += (dx / d) * 260 * dt; c.y += (dy / d) * 260 * dt; c.walk += dt * 1.6; }
+        else if (d < 120) { c.x -= (dx / d) * 200 * dt; c.y -= (dy / d) * 200 * dt; c.walk += dt * 1.6; }
+        if (c.shootT <= 0) {
+          c.shootT = 0.55;
+          this.projs.push({
+            x: c.x + (dx / d) * 24, y: c.y + (dy / d) * 24,
+            vx: (dx / d) * 700, vy: (dy / d) * 700,
+            dmg: this.basicDmg(c.owner) * 0.8, r: 7, friendly: true, pierce: false,
+            life: 0.9, color: "#d8e2e8", kind: "shuriken", disarm: false, hitSet: null, owner: c.owner,
+          });
+        }
+      }
+      c.x = Math.max(30, Math.min(WORLD_SIZE - 30, c.x));
+      c.y = Math.max(30, Math.min(WORLD_SIZE - 30, c.y));
+    }
+  }
+
+  /** Огненный дракон Вики: кружит вокруг хозяйки и жжёт область. */
+  private updateDragons(dt: number): void {
+    for (let i = this.dragons.length - 1; i >= 0; i--) {
+      const dr = this.dragons[i];
+      dr.t -= dt; dr.tickT -= dt;
+      dr.ang += dt * 2.4;
+      dr.x = dr.owner.x + Math.cos(dr.ang) * 200;
+      dr.y = dr.owner.y + Math.sin(dr.ang) * 130;
+      if (dr.t <= 0) {
+        this.spawnParticles(dr.x, dr.y, 26, "#ff8a3c", 300);
+        this.dragons.splice(i, 1);
+        continue;
+      }
+      this.spawnParticles(dr.x, dr.y, 2, "#ff8a3c", 140);
+      if (dr.tickT <= 0) {
+        dr.tickT = 0.25;
+        this.addLight(dr.x, dr.y, 220, 0.3);
+        for (const e of this.enemies) {
+          if (e.charmT > 0) continue;
+          if (Math.hypot(e.x - dr.x, e.y - dr.y) < 130 + e.radius) {
+            const ang = Math.atan2(e.y - dr.y, e.x - dr.x);
+            this.damageEnemy(e, this.basicDmg(dr.owner) * 0.7, Math.cos(ang) * 120, Math.sin(ang) * 120, dr.owner);
+            e.burnT = 2; e.burnDmg = this.basicDmg(dr.owner) * 0.5; e.burnOwner = dr.owner;
+          }
+        }
       }
     }
   }
@@ -1372,6 +1684,11 @@ export class Arpg {
     for (let i = this.tempLights.length - 1; i >= 0; i--) {
       this.tempLights[i].life -= dt;
       if (this.tempLights[i].life <= 0) this.tempLights.splice(i, 1);
+    }
+    // вспышки конусных атак
+    for (let i = this.cones.length - 1; i >= 0; i--) {
+      this.cones[i].life -= dt;
+      if (this.cones[i].life <= 0) this.cones.splice(i, 1);
     }
     // отложенные залпы («Тотальный отстрел» Даши)
     for (let i = this.volleys.length - 1; i >= 0; i--) {
@@ -1445,16 +1762,17 @@ export class Arpg {
         h: p.hero.id, x: r1(p.x), y: r1(p.y), fx: +p.facing.toFixed(2), wk: +p.walkPhase.toFixed(2), mv: p.moving,
         hp: Math.ceil(p.hp), mh: p.maxHp, mn: Math.floor(p.mana), lv: p.level, dm: +p.dmgMul.toFixed(2),
         sw: +Math.max(0, p.swingT).toFixed(2), sh: +Math.max(0, p.shieldT).toFixed(1), da: +Math.max(0, p.dashT).toFixed(2), al: p.alive,
-        // кулдауны для HUD клиента
-        ...({ cb: +Math.max(0, p.cdBasic).toFixed(1), cq: +Math.max(0, p.cdQ).toFixed(1), ce: +Math.max(0, p.cdE).toFixed(1), cr: +Math.max(0, p.cdR).toFixed(1), ct: +Math.max(0, p.cdT).toFixed(1) } as object),
-      } as SnapMsg["pl"][string];
+        mo: +Math.max(0, p.mountT).toFixed(1), rg: +Math.max(0, p.rageT).toFixed(1), spn: +Math.max(0, p.spinT).toFixed(1),
+        cb: +Math.max(0, p.cdBasic).toFixed(1), cq: +Math.max(0, p.cdQ).toFixed(1), ce: +Math.max(0, p.cdE).toFixed(1),
+        cr: +Math.max(0, p.cdR).toFixed(1), ct: +Math.max(0, p.cdT).toFixed(1), cf: +Math.max(0, p.cdF).toFixed(1),
+      };
     }
     const en: SnapMsg["en"] = [];
     for (const e of this.enemies) {
       if (e.nid === undefined) e.nid = this.nidSeq++;
       en.push({
         i: e.nid, k: ALL_ENEMY_KINDS.indexOf(e.kind), s: SPRITE_IDS.indexOf(e.sprite),
-        x: r1(e.x), y: r1(e.y), hp: Math.ceil(e.hp), mhp: Math.ceil(e.maxHp), b: e.boss, w: e.windup > 0,
+        x: r1(e.x), y: r1(e.y), hp: Math.ceil(e.hp), mhp: Math.ceil(e.maxHp), b: e.boss, w: e.windup > 0, c: e.charmT > 0,
       });
     }
     const pr: SnapMsg["pr"] = [];
@@ -1467,6 +1785,8 @@ export class Arpg {
       pl, en, pr,
       orb: this.orbs.map((o) => [Math.round(o.x), Math.round(o.y)]),
       sat: this.satorus.map((s) => ({ p: s.pid, x: r1(s.x), y: r1(s.y), l: +s.life.toFixed(1) })),
+      cl: this.clones.map((c) => ({ x: r1(c.x), y: r1(c.y), wk: +c.walk.toFixed(2) })),
+      dr: this.dragons.map((d) => ({ x: r1(d.x), y: r1(d.y), ang: +d.ang.toFixed(2) })),
     });
   }
 
@@ -1481,7 +1801,6 @@ export class Arpg {
     }
     // игроки
     for (const [pid, sp] of Object.entries(s.pl)) {
-      const extra = sp as unknown as { cb: number; cq: number; ce: number; cr: number; ct: number };
       let p = this.players.find((pl) => pl.pid === pid);
       if (!p) {
         p = makePlayer(pid, heroById(sp.h), pid === this.myPid);
@@ -1492,7 +1811,8 @@ export class Arpg {
         const prevHp = p.hp, prevLv = p.level;
         p.hp = sp.hp; p.maxHp = sp.mh; p.mana = sp.mn; p.level = sp.lv; p.dmgMul = sp.dm;
         p.shieldT = sp.sh; p.swingT = Math.max(p.swingT, 0);
-        p.cdBasic = extra.cb; p.cdQ = extra.cq; p.cdE = extra.ce; p.cdR = extra.cr; p.cdT = extra.ct;
+        p.cdBasic = sp.cb; p.cdQ = sp.cq; p.cdE = sp.ce; p.cdR = sp.cr; p.cdT = sp.ct; p.cdF = sp.cf;
+        p.mountT = sp.mo; p.rageT = sp.rg; p.spinT = sp.spn;
         if (sp.da > 0 && p.dashT <= 0) { p.dashT = sp.da; } // дэш, начатый на хосте по нашему же запросу
         if (sp.hp < prevHp) { p.hurtFlash = 0.25; this.shake = Math.min(16, this.shake + 5); this.audio.sfx("hit"); }
         if (sp.lv > prevLv) {
@@ -1509,6 +1829,7 @@ export class Arpg {
         p.tx = sp.x; p.ty = sp.y; p.facing = sp.fx; p.walkPhase = sp.wk; p.moving = sp.mv;
         p.hp = sp.hp; p.maxHp = sp.mh; p.level = sp.lv;
         p.shieldT = sp.sh; p.dashT = sp.da; p.swingT = sp.sw; p.alive = sp.al;
+        p.mountT = sp.mo; p.rageT = sp.rg; p.spinT = sp.spn;
       }
     }
     // враги
@@ -1524,6 +1845,7 @@ export class Arpg {
           speed: kind.speed, dmg: kind.dmg, radius: se.b ? 36 : kind.radius, xp: kind.xp,
           attackCd: 0, shootCd: 0, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
           anim: Math.random() * 10, sprite: SPRITE_IDS[se.s] ?? "enemy-hockey", windup: 0, nid: se.i,
+          charmT: se.c ? 3 : 0, burnT: 0, burnAcc: 0, burnDmg: 0,
         };
         this.enemyByNid.set(se.i, e);
         this.enemies.push(e);
@@ -1531,6 +1853,7 @@ export class Arpg {
       e.tx = se.x; e.ty = se.y;
       if (se.hp < e.hp) { e.flash = 0.12; this.spawnParticles(se.x, se.y, 3, e.kind.accent, 140); }
       e.hp = se.hp; e.maxHp = se.mhp;
+      e.charmT = se.c ? Math.max(e.charmT, 0.5) : 0;
       if (se.w && e.windup <= 0) e.windup = 0.25;
       if (se.b && !e.boss) e.boss = true;
     }
@@ -1583,6 +1906,9 @@ export class Arpg {
       cat.x = ss.x; cat.y = ss.y; cat.life = ss.l;
     }
     this.satorus = this.satorus.filter((c) => seenSat.has(c.pid));
+    // клоны и драконы — чисто визуальные на клиенте
+    this.clones = (s.cl ?? []).map((c) => ({ x: c.x, y: c.y, t: 1, shootT: 0, walk: c.wk, owner: this.me }));
+    this.dragons = (s.dr ?? []).map((d) => ({ x: d.x, y: d.y, t: 1, ang: d.ang, tickT: 0, owner: this.me }));
   }
 
   /** Эффекты смерти врага на клиенте (снапшот просто перестаёт его присылать). */
@@ -1633,28 +1959,81 @@ export class Arpg {
 
   /** Визуал чужого каста на клиенте (урона нет — его считает хост). */
   private spawnCastFx(heroId: string, k: string, x: number, y: number, dir: number): void {
-    if (k === "q" && heroId === "maxim") {
-      this.spawnParticles(x, y, 36, "#7ec8ff", 380);
-      this.spawnWave(x, y, 190, "#7ec8ff", 0, 20, 0.4);
-      this.addLight(x, y, 260, 0.25);
-      this.audio.sfx("explosion");
-    } else if (k === "e" && heroId === "vika") {
-      this.spawnParticles(x, y, 20, "#b58cff", 180);
-      this.audio.sfx("win");
-    } else if (k === "r") {
-      if (heroId === "nikita") {
-        this.spawnWave(x, y, 240, "#7ec8ff", 0, 22, 0.5);
-        this.addLight(x, y, 320, 0.3);
+    const ax = x + Math.cos(dir) * 70, ay = y + Math.sin(dir) * 70;
+    if (k === "q") {
+      if (heroId === "maxim") {
+        // Катон: оранжевое пламя конусом
+        this.spawnParticles(ax, ay, 30, "#ff8c3a", 320);
+        this.spawnParticles(ax, ay, 14, "#ffd24a", 220);
+        this.addLight(ax, ay, 280, 0.3);
+        this.audio.sfx("explosion");
+      } else if (heroId === "dasha") {
+        // Дробовик: вспышка выстрела
+        this.spawnParticles(x + Math.cos(dir) * 34, y + Math.sin(dir) * 34, 16, "#ffd24a", 260);
+        this.addLight(x, y, 180, 0.15);
+        this.audio.sfx("hit");
       } else if (heroId === "vika") {
-        this.spawnWave(x, y, 430, "#3ddc84", 0, 36, 0.7);
-        this.spawnWave(x, y, 300, "#b0ffd0", 0, 18, 0.55);
-        this.spawnParticles(x, y, 40, "#3ddc84", 380);
-        this.addLight(x, y, 430, 0.5);
+        // Империус: зелёная вспышка подчинения
+        this.spawnParticles(x, y, 24, "#3ddc84", 240);
+        this.spawnWave(x, y, 170, "#3ddc84", 0, 14, 0.35);
+        this.audio.sfx("win");
       } else {
-        this.addLight(x, y, 260, 0.2);
+        // Ледяной прорыв Никиты
+        this.spawnParticles(x, y, 28, "#7ec8ff", 340);
+        this.spawnWave(x, y, 180, "#bfe4ff", 0, 16, 0.35);
+        this.audio.sfx("move");
+      }
+    } else if (k === "e") {
+      if (heroId === "vika") {
+        // Инсендио: конус пламени
+        this.spawnParticles(ax, ay, 30, "#ff6a2a", 320);
+        this.addLight(ax, ay, 280, 0.3);
+        this.audio.sfx("explosion");
+      } else if (heroId === "maxim") {
+        // Призыв жабы: зелёный дым
+        this.spawnParticles(x, y, 32, "#7ab54a", 240);
+        this.spawnWave(x, y, 150, "#7ab54a", 0, 14, 0.3);
+        this.audio.sfx("win");
+      } else if (heroId === "dasha") {
+        // Крутящийся стрелок: кольцо вспышек
+        this.spawnParticles(x, y, 22, "#ffd24a", 280);
+        this.audio.sfx("hit");
+      } else {
+        // Конусный замах Никиты
+        this.spawnWave(x, y, 210, "#bfe4ff", 0, 18, 0.3);
+        this.audio.sfx("hit");
+      }
+    } else if (k === "r") {
+      if (heroId === "maxim") {
+        // Теневой клон: голубой дым
+        this.spawnParticles(x, y, 36, "#9fd8ff", 280);
+        this.spawnWave(x, y, 140, "#9fd8ff", 0, 14, 0.3);
+      } else {
+        // Маунты: дым и свет призыва
+        this.spawnParticles(x, y, 26, "#c9c9c9", 220);
+        this.addLight(x, y, 220, 0.25);
+      }
+      this.audio.sfx("win");
+    } else if (k === "t") {
+      // Ультимейты
+      if (heroId === "nikita") {
+        this.spawnParticles(x, y, 36, "#ff3a2a", 340);
+        this.spawnWave(x, y, 240, "#ff3a2a", 0, 22, 0.5);
+        this.addLight(x, y, 320, 0.4);
+      } else if (heroId === "maxim") {
+        this.spawnParticles(x, y, 30, "#7ec8ff", 320);
+        this.addLight(x, y, 300, 0.35);
+      } else if (heroId === "dasha") {
+        this.spawnWave(x, y, 300, "#c9a15a", 0, 26, 0.5);
+        this.spawnParticles(x, y, 30, "#ffd24a", 300);
+        this.addLight(x, y, 340, 0.4);
+      } else {
+        this.spawnParticles(x, y, 36, "#ff8c3a", 340);
+        this.addLight(x, y, 360, 0.45);
       }
       this.audio.sfx("explosion");
-    } else if (k === "t") {
+    } else if (k === "f") {
+      // Зов САТОРУ: белый дым и звон
       this.spawnParticles(x, y - 40, 24, "#e8e8e8", 240);
       this.audio.sfx("win");
     } else if (k === "lvl") {
@@ -1662,7 +2041,6 @@ export class Arpg {
       this.spawnWave(x, y, 200, "#ffd24a", 0, 18, 0.5);
       this.addLight(x, y, 300, 0.4);
     }
-    void dir;
   }
 
   /** Клиентское движение сущностей между снапшотами. */
@@ -1709,7 +2087,7 @@ export class Arpg {
           this.audio.sfx("ui");
           if (b.act === "solo") { this.netMode = "off"; this.startRun(HEROES[this.selIndex]); }
           else if (b.act === "create") this.createLobby();
-          else if (b.act === "join") { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; }
+          else if (b.act === "join") { this.selScreen = "join"; this.joinCode = ""; this.lobbyError = ""; this.input.drainPresses(); }
           return;
         }
       }
@@ -1769,7 +2147,15 @@ export class Arpg {
 
   /** Отладочные хуки для автопроверки (не используются в игре). */
   debugBoss(): void { this.nextBossAt = 0; }
-  debugHeal(): void { this.hp = this.maxHp = 9999; }
+  debugHeal(): void { this.hp = this.maxHp = 9999; this.mana = this.maxMana; }
+  debugInfo(): Record<string, unknown> {
+    return {
+      state: this.state, px: this.px, py: this.py, camX: this.camX(), camY: this.camY(),
+      shake: this.shake, projs: this.projs.length, waves: this.waves.length,
+      cones: this.cones.length, lights: this.tempLights.length, mapReady: !!this.mapCanvas,
+      cdT: this.me.cdT, mana: this.me.mana,
+    };
+  }
 
   // ---------- рендер ----------
 
@@ -1866,6 +2252,7 @@ export class Arpg {
       this.drawEnemy(ctx, e, camX, camY);
     }
     for (const s of this.satorus) this.drawSatoru(ctx, s, camX, camY);
+    for (const c of this.clones) this.drawClone(ctx, c, camX, camY);
     for (const p of this.players) {
       if (p.isLocal) this.drawPlayer(ctx, camX, camY);
       else this.drawRemotePlayer(ctx, p, camX, camY);
@@ -1956,6 +2343,24 @@ export class Arpg {
     ctx.globalAlpha = 1;
     this.perfSec[2] += performance.now() - tSec; tSec = performance.now();
 
+    // вспышки конусных атак (Катон, Инсендио, дробовик)
+    for (const c of this.cones) {
+      const a = Math.max(0, c.life / c.maxLife);
+      const x = c.x - camX, y = c.y - camY;
+      ctx.globalAlpha = a * 0.45;
+      const cg = ctx.createRadialGradient(x, y, 10, x, y, c.range);
+      cg.addColorStop(0, "#ffffff");
+      cg.addColorStop(0.3, c.color);
+      cg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = cg;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.arc(x, y, c.range * (1.15 - a * 0.15), c.dir - c.half, c.dir + c.half);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
     // ударные волны (ультимейты, взрывы)
     for (const wv of this.waves) {
       const x = wv.x - camX, y = wv.y - camY;
@@ -1971,6 +2376,9 @@ export class Arpg {
       ctx.beginPath(); ctx.arc(x, y, wv.r, 0, Math.PI * 2); ctx.stroke();
       ctx.globalAlpha = 1;
     }
+
+    // огненные драконы
+    for (const dr of this.dragons) this.drawDragon(ctx, dr, camX, camY);
 
     if (!this.skipSec.has("light")) this.renderLighting(ctx, camX, camY);
     this.perfSec[3] += performance.now() - tSec; tSec = performance.now();
@@ -2203,7 +2611,18 @@ export class Arpg {
     // лёгкое покачивание на месте
     const idleBob = moving ? 0 : Math.sin(this.time * 2) * 1.2;
 
-    this.drawPuppet(ctx, "hero-" + this.hero.id, x, y + 26 + idleBob, 76, { flip, walk, filter, scalePulse: pulse, attackT });
+    // маунт под героем (замбони / жаба / бэтмобиль / гиппогриф)
+    const mounted = this.me.mountT > 0;
+    if (mounted) this.drawMount(ctx, this.hero.id, x, y + 30, flip);
+    // ярость Никиты: красная аура и рост
+    const raging = this.me.rageT > 0;
+    if (raging) {
+      const gr = 95;
+      ctx.globalAlpha = 0.5 + Math.sin(this.time * 10) * 0.15;
+      ctx.drawImage(this.glowSprite("rgba(255,60,30,0.85)"), x - gr, y - 20 - gr, gr * 2, gr * 2);
+      ctx.globalAlpha = 1;
+    }
+    this.drawPuppet(ctx, "hero-" + this.hero.id, x, y + 26 + idleBob - (mounted ? 34 : 0), 76, { flip, walk: mounted ? 0 : walk, filter, scalePulse: pulse * (raging ? 1.35 : 1), attackT });
 
     // дуга замаха клюшкой (Никита): белый веер по направлению удара
     if (this.hero.id === "nikita" && this.swingT > 0) {
@@ -2314,6 +2733,16 @@ export class Arpg {
       ctx.textAlign = "center";
       ctx.fillText("ОБЕЗОРУЖЕН", x, y - hh - 14);
     }
+    // подчинённый Империусом: зелёное кольцо союзника
+    if (e.charmT > 0) {
+      ctx.strokeStyle = `rgba(61,220,132,${0.55 + Math.sin(this.time * 6) * 0.2})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.ellipse(x, y + r * 0.9, r * 1.5 * scale, r * 0.55 * scale, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = "#3ddc84";
+      ctx.font = "bold 11px Georgia";
+      ctx.textAlign = "center";
+      ctx.fillText("ПОДЧИНЁН", x, y - hh - 26);
+    }
     // полоса HP
     if (e.hp < e.maxHp) {
       const wpx = r * 2.2 * scale;
@@ -2342,7 +2771,15 @@ export class Arpg {
     const idleBob = p.moving ? 0 : Math.sin(this.time * 2) * 1.2;
     ctx.save();
     if (!p.alive) ctx.globalAlpha = 0.3;
-    this.drawPuppet(ctx, "hero-" + p.hero.id, x, y + 26 + idleBob, 76, { flip, walk, attackT });
+    const mounted = p.mountT > 0 && p.alive;
+    if (mounted) this.drawMount(ctx, p.hero.id, x, y + 30, flip);
+    if (p.rageT > 0 && p.alive) {
+      const gr = 95;
+      ctx.globalAlpha = 0.5 + Math.sin(this.time * 10) * 0.15;
+      ctx.drawImage(this.glowSprite("rgba(255,60,30,0.85)"), x - gr, y - 20 - gr, gr * 2, gr * 2);
+      ctx.globalAlpha = 1;
+    }
+    this.drawPuppet(ctx, "hero-" + p.hero.id, x, y + 26 + idleBob - (mounted ? 34 : 0), 76, { flip, walk: mounted ? 0 : walk, attackT, scalePulse: p.rageT > 0 ? 1.35 : 1 });
     ctx.restore();
     // купол Протего чужого игрока
     if (p.shieldT > 0 && p.alive) {
@@ -2367,6 +2804,117 @@ export class Arpg {
       ctx.font = "bold 12px Georgia";
       ctx.fillText("ПАЛ", x, y - 80);
     }
+  }
+
+  /** Теневой клон Максима: полупрозрачная голубая копия героя. */
+  private drawClone(ctx: CanvasRenderingContext2D, c: CloneEnt, camX: number, camY: number): void {
+    const x = c.x - camX, y = c.y - camY;
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.beginPath(); ctx.ellipse(x, y + 20, 20, 7, 0, 0, Math.PI * 2); ctx.fill();
+    this.drawPuppet(ctx, "hero-maxim", x, y + 26, 70, { walk: c.walk * 11, alpha: 0.65, filter: "hue-rotate(160deg) brightness(1.3)" });
+    ctx.fillStyle = "rgba(159,216,255,0.8)";
+    ctx.font = "bold 11px Georgia";
+    ctx.textAlign = "center";
+    ctx.fillText("КЛОН", x, y - 56);
+  }
+
+  /** Огненный дракон: светящееся тело, крылья и шлейф пламени. */
+  private drawDragon(ctx: CanvasRenderingContext2D, dr: DragonEnt, camX: number, camY: number): void {
+    const x = dr.x - camX, y = dr.y - camY;
+    const flap = Math.sin(this.time * 14) * 0.6;
+    const dir = dr.ang + Math.PI / 2;
+    // свечение
+    const gr = 90;
+    ctx.drawImage(this.glowSprite("rgba(255,120,40,0.85)"), x - gr, y - gr, gr * 2, gr * 2);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(dir);
+    // крылья
+    ctx.fillStyle = "rgba(255,140,60,0.85)";
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.rotate(side * (0.5 + flap * 0.4));
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(side * 70, -22);
+      ctx.lineTo(side * 46, 10);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    // тело и голова
+    ctx.fillStyle = "#ff6a2a";
+    ctx.beginPath(); ctx.ellipse(0, 0, 34, 16, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(38, -4, 12, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffe08a";
+    ctx.beginPath(); ctx.arc(42, -6, 4, 0, Math.PI * 2); ctx.fill();
+    // пасть с пламенем
+    ctx.fillStyle = "rgba(255,220,120,0.9)";
+    ctx.beginPath();
+    ctx.moveTo(48, 0); ctx.lineTo(78 + Math.random() * 14, -6); ctx.lineTo(78 + Math.random() * 14, 6);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  /** Маунт под героем: замбони, жаба, бэтмобиль или гиппогриф. */
+  private drawMount(ctx: CanvasRenderingContext2D, heroId: string, x: number, y: number, flip: boolean): void {
+    ctx.save();
+    ctx.translate(x, y);
+    if (flip) ctx.scale(-1, 1);
+    if (heroId === "nikita") {
+      // замбони: синяя машина с баком и щёткой
+      ctx.fillStyle = "#2a5a9a";
+      ctx.fillRect(-46, -26, 92, 26);
+      ctx.fillStyle = "#3a7ac0";
+      ctx.fillRect(-34, -44, 44, 22);
+      ctx.fillStyle = "#bfe4ff";
+      ctx.fillRect(-30, -40, 20, 14);
+      ctx.fillStyle = "#1a1a1e";
+      ctx.beginPath(); ctx.arc(-28, 2, 10, 0, Math.PI * 2); ctx.arc(28, 2, 10, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#8a8a92";
+      ctx.fillRect(40, -12, 16, 12); // щётка
+    } else if (heroId === "maxim") {
+      // жаба: зелёное тело, глаза
+      ctx.fillStyle = "#5a8a3a";
+      ctx.beginPath(); ctx.ellipse(0, -18, 52, 26, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#7ab54a";
+      ctx.beginPath(); ctx.ellipse(0, -10, 44, 16, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.beginPath(); ctx.arc(22, -40, 9, 0, Math.PI * 2); ctx.arc(40, -38, 9, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#1a1a1e";
+      ctx.beginPath(); ctx.arc(24, -40, 4, 0, Math.PI * 2); ctx.arc(42, -38, 4, 0, Math.PI * 2); ctx.fill();
+    } else if (heroId === "dasha") {
+      // бэтмобиль: чёрная машина с плавниками
+      ctx.fillStyle = "#14141a";
+      ctx.beginPath();
+      ctx.moveTo(-52, 0); ctx.lineTo(-38, -22); ctx.lineTo(20, -26); ctx.lineTo(52, -8); ctx.lineTo(52, 0);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#2a2a34";
+      ctx.fillRect(-44, -34, 12, 26); // плавник
+      ctx.fillStyle = "#ffd24a";
+      ctx.fillRect(46, -14, 8, 6); // фара
+      ctx.fillStyle = "#0a0a0e";
+      ctx.beginPath(); ctx.arc(-24, 2, 11, 0, Math.PI * 2); ctx.arc(26, 2, 11, 0, Math.PI * 2); ctx.fill();
+    } else {
+      // гиппогриф: серо-коричневое тело с крыльями
+      const flap = Math.sin(this.time * 10) * 8;
+      ctx.fillStyle = "#8a7a5a";
+      ctx.beginPath(); ctx.ellipse(0, -18, 46, 22, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#c9b18a";
+      ctx.beginPath(); ctx.arc(40, -34, 14, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#e8d9a0";
+      ctx.beginPath(); ctx.moveTo(50, -34); ctx.lineTo(64, -30); ctx.lineTo(50, -26); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "rgba(200,180,140,0.85)";
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(-6, -30);
+        ctx.lineTo(-30 - flap, -62);
+        ctx.lineTo(10, -40);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    ctx.restore();
   }
 
   private drawSatoru(ctx: CanvasRenderingContext2D, s: SatoruEnt, camX: number, camY: number): void {
@@ -2517,12 +3065,13 @@ export class Arpg {
     ctx.fillText(`${this.hero.name} • ур. ${this.level} • урон ×${this.dmgMul.toFixed(2)}`, w / 2, py + 20);
 
     // скиллы
-    const slots = [
+    const slots: Array<{ label: string; name: string; cd: number; max: number; accent?: string }> = [
       { label: "ЛКМ", name: this.hero.basicName, cd: 0, max: 1 },
       { label: "Q", name: this.hero.q.name, cd: Math.max(0, this.cdQ), max: this.hero.q.cooldown },
       { label: "E", name: this.hero.e.name, cd: Math.max(0, this.cdE), max: this.hero.e.cooldown },
       { label: "R", name: this.hero.r.name, cd: Math.max(0, this.cdR), max: this.hero.r.cooldown },
-      { label: "T", name: this.hero.ult.name, cd: Math.max(0, this.cdT), max: this.hero.ult.cooldown },
+      { label: "T", name: this.hero.ult.name, cd: Math.max(0, this.cdT), max: this.hero.ult.cooldown, accent: "#ff9a5a" },
+      { label: "F", name: SATORU.name, cd: Math.max(0, this.cdF), max: SATORU.cooldown, accent: "#ffd24a" },
     ];
     const sw = 56, gap = 10;
     const sx = w / 2 - (slots.length * (sw + gap) - gap) / 2;
@@ -2533,7 +3082,7 @@ export class Arpg {
       sg.addColorStop(1, "#100c0a");
       ctx.fillStyle = sg;
       ctx.fillRect(x, y, sw, sw);
-      ctx.strokeStyle = "#a08040"; ctx.lineWidth = 2;
+      ctx.strokeStyle = slots[i].accent ?? "#a08040"; ctx.lineWidth = 2;
       ctx.strokeRect(x, y, sw, sw);
       ctx.fillStyle = "#f0e6d0";
       ctx.font = "bold 14px Georgia";
@@ -2561,7 +3110,7 @@ export class Arpg {
     ctx.textAlign = "right";
     ctx.fillStyle = "rgba(240,230,208,0.45)";
     ctx.font = "12px Georgia";
-    ctx.fillText("WASD — движение • Q/E — навыки • R — ультимейт • T — САТОРУ • Esc — пауза • M — звук", w - 20, h - 126);
+    ctx.fillText("WASD — движение • Q/E/R — навыки • T — ультимейт • F — САТОРУ • Esc — пауза • M — звук", w - 20, h - 126);
 
     if (this.state === "pause") {
       ctx.fillStyle = "rgba(0,0,0,0.65)";
@@ -2691,13 +3240,14 @@ export class Arpg {
       ctx.textAlign = "left";
       ctx.fillStyle = "#d8cbaa";
       ctx.font = "13px Georgia";
-      ctx.fillText(`ЛКМ — ${hero.basicName}`, x + 16, y0 + 268);
-      ctx.fillText(`Q — ${hero.q.name}`, x + 16, y0 + 288);
-      ctx.fillText(`E — ${hero.e.name}`, x + 16, y0 + 308);
+      ctx.fillText(`ЛКМ — ${hero.basicName}`, x + 16, y0 + 266);
+      ctx.fillText(`Q — ${hero.q.name}`, x + 16, y0 + 285);
+      ctx.fillText(`E — ${hero.e.name}`, x + 16, y0 + 304);
+      ctx.fillText(`R — ${hero.r.name}`, x + 16, y0 + 323);
       ctx.fillStyle = "#ff9a5a";
-      ctx.fillText(`R — ${hero.r.name}`, x + 16, y0 + 328);
+      ctx.fillText(`T — ${hero.ult.name}`, x + 16, y0 + 342);
       ctx.fillStyle = "#c9a15a";
-      ctx.fillText(`T — ${hero.ult.name}`, x + 16, y0 + 348);
+      ctx.fillText(`F — ${SATORU.name}`, x + 16, y0 + 361);
       ctx.textAlign = "center";
 
       const best = this.best[hero.id];
