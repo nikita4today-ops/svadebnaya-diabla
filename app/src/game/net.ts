@@ -17,8 +17,8 @@ export function makeRoomCode(): string {
 }
 
 export interface LobbyPlayer { pid: string; hero: string; host: boolean }
-export interface LobbyMsg { pl: LobbyPlayer[] }
-export interface StartMsg { pl: LobbyPlayer[] }
+export interface LobbyMsg { pl: LobbyPlayer[]; map?: string }
+export interface StartMsg { pl: LobbyPlayer[]; map?: string }
 export interface HeroMsg { hero: string }
 export interface InpMsg { x: number; y: number; fx: number; wk: number; mv: boolean }
 export interface CastMsg { k: string; dir: number }
@@ -37,6 +37,8 @@ export interface SnapPlayer {
   g: number; pts: number; sk: number[]; bu: number[];
   /** Временные бонусы из лута: рапира (без перезарядки), берсерк, эгида. */
   ru: number; bs: number; iv: number;
+  /** Личные убийства (лидерборд) и прогресс воскрешения союзником (0..1). */
+  k: number; rp: number;
 }
 export interface SnapEnemy { i: number; k: number; s: number; x: number; y: number; hp: number; mhp: number; b: boolean; w: boolean; c: boolean }
 export interface SnapProj { i: number; k: string; x: number; y: number; vx: number; vy: number; r: number; c: string; f: boolean }
@@ -52,13 +54,16 @@ export interface SnapMsg {
   cl: SnapClone[]; dr: SnapDragon[];
   /** Золото [x,y] и лут [x,y,kind] на земле. */
   gold: number[][]; loot: Array<[number, number, string]>;
+  /** Телеграфы атак [x, y, r, осталось сек, kind (0=босс, 1=метеор)]. */
+  tel: number[][];
 }
 
 export type EvMsg =
   | { t: "ann"; x: string; s: string }
   | { t: "castfx"; h: string; k: string; x: number; y: number; dir: number }
   | { t: "boom"; x: number; y: number }
-  | { t: "over"; time: number; kills: number; wave: number };
+  | { t: "over"; time: number; kills: number; wave: number }
+  | { t: "pause"; on: boolean };
 
 type Handler<T> = (data: T, peerId: string) => void;
 

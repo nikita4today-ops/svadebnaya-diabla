@@ -105,6 +105,21 @@ if (hi.players < 2) await fail("хост не видит 2 игроков");
 if (ci.players < 2) await fail("клиент не видит 2 игроков");
 if (hi.enemies < 1) await fail("у хоста нет врагов");
 if (ci.enemies < 1) await fail("клиент не видит врагов");
+
+console.log("7. пауза хоста для всего лобби…");
+await host.keyboard.press("Escape");
+await new Promise((r) => setTimeout(r, 700));
+const hp = await host.evaluate(() => window.__dbg2().paused);
+const cp = await client.evaluate(() => window.__dbg2().paused);
+if (!hp) await fail("у хоста не включилась пауза");
+if (!cp) await fail("пауза не дошла до клиента");
+await host.screenshot({ path: join(SHOTS, "coop-pause.png") });
+await host.keyboard.press("Escape");
+await new Promise((r) => setTimeout(r, 700));
+const cp2 = await client.evaluate(() => window.__dbg2().paused);
+if (cp2) await fail("пауза не снялась у клиента");
+console.log("   пауза включается и снимается у обоих");
+
 if (errors.host.length || errors.client.length) await fail(`console errors: ${JSON.stringify(errors)}`);
 
 console.log("COOP OK: два игрока в одном бою, враги синхронизированы, ошибок нет");

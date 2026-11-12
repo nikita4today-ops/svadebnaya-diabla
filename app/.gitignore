@@ -28,3 +28,4 @@ verification-shots
 
 # Local build cleanup history
 .game-build-files.json
+assets-gen/

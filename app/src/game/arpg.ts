@@ -49,6 +49,8 @@ interface Enemy {
   anim: number; sprite: string;
   /** Замах перед ударом: >0 — идёт телеграф атаки, урон при достижении 0. */
   windup: number;
+  /** Этап 3 (боссы): кулдауны телеграфа под целью и призыва миньонов. */
+  telCd: number; sumCd: number;
   /** Империус (Вика): враг временно сражается за героев. */
   charmT: number; charmOwner?: PlayerEnt;
   /** Поджог (Катон/Инсендио/дракон): урон раз в 0.5 с. */
@@ -85,6 +87,8 @@ interface PlayerEnt {
   gold: number; buys: number[];
   cdRushT: number; berserkT: number; invulnT: number;
   alive: boolean;
+  /** Этап 3: личные убийства (лидерборд), прогресс воскрешения, место гибели. */
+  kills: number; reviveProg: number; deadX: number; deadY: number;
   /** Цель интерполяции для удалённых игроков. */
   tx: number; ty: number;
   trail: Array<{ x: number; y: number; life: number }>;
@@ -104,6 +108,7 @@ function makePlayer(pid: string, hero: HeroDef, isLocal: boolean): PlayerEnt {
     leapT: 0, leapFromX: 0, leapFromY: 0, leapToX: 0, leapToY: 0, cdF: 0,
     skillPts: 0, sk: { q: 1, e: 1, r: 1, t: 0 }, gold: 0, buys: [0, 0, 0, 0, 0, 0],
     cdRushT: 0, berserkT: 0, invulnT: 0,
+    kills: 0, reviveProg: 0, deadX: 0, deadY: 0,
     alive: true, tx: WORLD_SIZE / 2, ty: WORLD_SIZE / 2, trail: [],
   };
 }
@@ -275,6 +280,12 @@ export class Arpg {
   private shopOpen = false;
   private golds: Array<{ x: number; y: number; v: number; t: number }> = [];
   private loots: Array<{ x: number; y: number; kind: LootKind; t: number }> = [];
+  /** Этап 3: телеграфы (атаки боссов и катаклизмы), пауза хоста, метеоры, карта коопа. */
+  private telegraphs: Array<{ x: number; y: number; r: number; t: number; maxT: number; dmg: number; kind: "boss" | "meteor" }> = [];
+  private netPaused = false;
+  private meteorT = 16;
+  private meteorAnnounced = false;
+  private lobbyMap = "coop";
   private satorus: SatoruEnt[] = [];
   private clones: CloneEnt[] = [];
   private dragons: DragonEnt[] = [];
@@ -483,6 +494,7 @@ export class Arpg {
       this.lobbyWait = 0;
       const before = this.lobbyPlayers.map((p) => p.pid).join(",");
       this.lobbyPlayers = d.pl;
+      this.lobbyMap = d.map ?? "coop";
       // нас ещё нет в списке — представляемся
       if (!d.pl.some((p) => p.pid === this.myPid)) {
         net.sendHero({ pid: this.myPid, hero: HEROES[this.selIndex].id } as never, );
@@ -494,7 +506,7 @@ export class Arpg {
       if (this.netMode !== "client") return;
       this.hostPeerId = peerId;
       const meLp = d.pl.find((p) => p.pid === this.myPid);
-      this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, d.pl);
+      this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, d.pl, d.map);
     });
     net.onInp((d, peerId) => {
       if (this.netMode !== "host" || this.state !== "play") return;
@@ -526,14 +538,14 @@ export class Arpg {
   }
 
   private broadcastLobby(): void {
-    this.net?.sendLobby({ pl: this.lobbyPlayers });
+    this.net?.sendLobby({ pl: this.lobbyPlayers, map: this.lobbyMap });
   }
 
   private hostStartCoop(): void {
     if (!this.net) return;
-    this.net.sendStart({ pl: this.lobbyPlayers });
+    this.net.sendStart({ pl: this.lobbyPlayers, map: this.lobbyMap });
     const meLp = this.lobbyPlayers.find((p) => p.pid === this.myPid);
-    this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, this.lobbyPlayers);
+    this.startRun(heroById(meLp?.hero ?? HEROES[this.selIndex].id), true, this.lobbyPlayers, this.lobbyMap);
   }
 
   private updateLobby(dt: number): void {
@@ -555,6 +567,14 @@ export class Arpg {
         if (this.lobbyPlayers.length >= 2) this.hostStartCoop();
         else this.lobbyError = "нужно хотя бы 2 игрока";
       }
+      // выбор карты стрелками
+      if (this.input.consumeAction("ArrowLeft") || this.input.consumeAction("ArrowRight")) {
+        const ids = ["coop", "arena", "odintsovo", "school", "hogwarts"];
+        const ix = (ids.indexOf(this.lobbyMap) + 1) % ids.length;
+        this.lobbyMap = ids[ix];
+        this.broadcastLobby();
+        this.audio.sfx("ui");
+      }
     } else {
       // клиент: ждём первый ответ хоста
       if (!this.hostPeerId && this.lobbyWait > 0) {
@@ -571,11 +591,12 @@ export class Arpg {
 
   // ---------- управление состоянием ----------
 
-  private startRun(hero: HeroDef, coop = false, lobbyPl?: LobbyPlayer[]): void {
+  private startRun(hero: HeroDef, coop = false, lobbyPl?: LobbyPlayer[], mapId?: string): void {
     this.hero = hero;
     if (coop && lobbyPl) {
-      this.map = COOP_MAP;
-      this.mapCanvas = paintMap("arena");
+      const picked = mapId && mapId !== "coop" ? (MAPS as Record<string, MapDef>)[mapId] : undefined;
+      this.map = picked ?? COOP_MAP;
+      this.mapCanvas = paintMap(picked ? picked.id : "arena");
       this.players = lobbyPl.map((lp, i) => {
         const p = makePlayer(lp.pid, heroById(lp.hero), lp.pid === this.myPid);
         const a = (i / lobbyPl.length) * Math.PI * 2;
@@ -603,6 +624,8 @@ export class Arpg {
     this.waveState = "fight"; this.breakT = 0; this.waveSpawnLeft = 0;
     this.shopOpen = false; this.golds = []; this.loots = [];
     this.satorus = []; this.shake = 0;
+    this.telegraphs = []; this.netPaused = false;
+    this.meteorT = 16; this.meteorAnnounced = false;
     this.netSendT = 0;
     this.state = "play";
     this.audio.startMusic();
@@ -659,11 +682,17 @@ export class Arpg {
       else if (this.netMode === "off") {
         this.state = this.state === "pause" ? "play" : "pause";
         this.audio.sfx("ui");
+      } else if (this.netMode === "host") {
+        this.netPaused = !this.netPaused;
+        this.net?.sendEv({ t: "pause", on: this.netPaused });
+        this.announce(this.netPaused ? "ПАУЗА" : "БОЙ ПРОДОЛЖАЕТСЯ", this.netPaused ? "хост поставил паузу для всего лобби" : "");
+        this.audio.sfx("ui");
       } else {
-        this.floaters.push({ x: this.px, y: this.py - 40, text: "В КООПЕ ПАУЗЫ НЕТ", color: "#c9a15a", life: 1 });
+        this.floaters.push({ x: this.px, y: this.py - 40, text: "ПАУЗУ СТАВИТ ТОЛЬКО ХОСТ", color: "#c9a15a", life: 1 });
       }
     }
     if (this.state === "pause") return;
+    if (this.netPaused) return; // пауза хоста: мир заморожен у всех
 
     // хит-стоп: микрозамедление при убийствах (удар чувствуется весомым)
     if (this.hitStop > 0) { this.hitStop -= dt; dt *= 0.12; }
@@ -690,6 +719,18 @@ export class Arpg {
             if (e.nid !== undefined) this.enemyByNid.delete(e.nid);
           }
           this.enemies = [];
+          // перерыв возвращает павших союзников в бой
+          for (const p of this.players) {
+            if (p.alive) continue;
+            p.alive = true; p.hp = p.maxHp * 0.6; p.reviveProg = 0;
+            const ra = Math.random() * Math.PI * 2;
+            p.x = WORLD_SIZE / 2 + Math.cos(ra) * 120; p.y = WORLD_SIZE / 2 + Math.sin(ra) * 120;
+            p.tx = p.x; p.ty = p.y;
+            if (p.isLocal) this.audio.sfx("win");
+            this.spawnWave(p.x, p.y, 160, "#7ee87a", 0, 18, 0.5);
+            this.announce(`${p.hero.name} ВОСКРЕС`, "перерыв между волнами возвращает павших");
+            if (coop) this.net?.sendEv({ t: "ann", x: `${p.hero.name} ВОСКРЕС`, s: "перерыв между волнами возвращает павших" });
+          }
           this.waveState = "break"; this.breakT = BREAK_DURATION;
           this.announce("ВОЛНА ЗАЧИЩЕНА!", `перерыв ${BREAK_DURATION} сек — прокачка (1-4) и магазин (B)`);
           if (coop) this.net?.sendEv({ t: "ann", x: "ВОЛНА ЗАЧИЩЕНА!", s: `перерыв ${BREAK_DURATION} сек — прокачка (1-4) и магазин (B)` });
@@ -824,6 +865,52 @@ export class Arpg {
         if (l.t > 30) this.loots.splice(i, 1);
       }
 
+      // телеграфы: красная зона зарядки, затем взрыв
+      for (let i = this.telegraphs.length - 1; i >= 0; i--) {
+        const tg = this.telegraphs[i];
+        tg.t -= dt;
+        if (tg.t > 0) continue;
+        this.telegraphs.splice(i, 1);
+        for (const p of this.players) {
+          if (p.alive && Math.hypot(p.x - tg.x, p.y - tg.y) < tg.r) this.hurtPlayer(p, tg.dmg);
+        }
+        if (tg.kind === "meteor") {
+          // метеорит бьёт и по врагам — хаос на поле боя
+          for (const e of [...this.enemies]) {
+            if (e.charmT <= 0 && Math.hypot(e.x - tg.x, e.y - tg.y) < tg.r) {
+              this.damageEnemy(e, 260, (e.x - tg.x) * 2, (e.y - tg.y) * 2, undefined);
+            }
+          }
+        }
+        this.spawnWave(tg.x, tg.y, tg.r * 1.5, tg.kind === "meteor" ? "#ff8a3c" : "#e83c3c", 0, 30, 0.5);
+        this.spawnParticles(tg.x, tg.y, 36, tg.kind === "meteor" ? "#ff8a3c" : "#e83c3c", 380);
+        this.decals.push({ x: tg.x, y: tg.y, r: tg.r * 0.5, color: "#181008", alpha: 0.6 });
+        this.addLight(tg.x, tg.y, tg.r * 2.2, 0.35);
+        this.shake = Math.min(20, this.shake + 8);
+        this.audio.sfx("explosion");
+      }
+
+      // катаклизм: метеоритный дождь в боевой фазе
+      this.meteorT -= dt;
+      if (this.meteorT <= 0) {
+        this.meteorT = Math.max(7, 15 - this.wave * 0.5);
+        if (this.waveState === "fight") {
+          const alivePl = this.players.filter((p) => p.alive);
+          const tgt2 = alivePl[Math.floor(Math.random() * Math.max(1, alivePl.length))];
+          if (tgt2) {
+            const ma = Math.random() * Math.PI * 2, md = 60 + Math.random() * 240;
+            const mx = Math.max(80, Math.min(WORLD_SIZE - 80, tgt2.x + Math.cos(ma) * md));
+            const my = Math.max(80, Math.min(WORLD_SIZE - 80, tgt2.y + Math.sin(ma) * md));
+            this.telegraphs.push({ x: mx, y: my, r: 120, t: 1.6, maxT: 1.6, dmg: 26 * this.dmgMulE, kind: "meteor" });
+            if (!this.meteorAnnounced) {
+              this.meteorAnnounced = true;
+              this.announce("КАТАКЛИЗМ: МЕТЕОРИТЫ", "не стой в красных кругах!");
+              if (coop) this.net?.sendEv({ t: "ann", x: "КАТАКЛИЗМ: МЕТЕОРИТЫ", s: "не стой в красных кругах!" });
+            }
+          }
+        }
+      }
+
       // уровни игроков
       for (const p of this.players) {
         if (p.xp < p.xpNext) continue;
@@ -850,8 +937,24 @@ export class Arpg {
       for (const p of this.players) {
         if (p.alive && p.hp <= 0) {
           p.alive = false;
+          p.deadX = p.x; p.deadY = p.y; p.reviveProg = 0;
           if (p.isLocal) { this.announce("ВЫ ПАЛИ", this.players.some((q) => q.alive) ? "команда сражается дальше" : ""); this.audio.sfx("lose"); }
           else this.net?.sendEv({ t: "ann", x: `${p.hero.name} ПАЛ`, s: "" });
+        }
+      }
+      // воскрешение: живой союзник рядом с павшим 2.5 с возвращает его в бой
+      for (const p of this.players) {
+        if (p.alive) continue;
+        const near = this.players.some((q) => q.alive && Math.hypot(q.x - p.deadX, q.y - p.deadY) < 90);
+        p.reviveProg = Math.max(0, Math.min(1, p.reviveProg + (near ? dt / 2.5 : -dt / 5)));
+        if (p.reviveProg >= 1) {
+          p.alive = true; p.hp = p.maxHp * 0.5; p.reviveProg = 0;
+          p.x = p.deadX; p.y = p.deadY; p.tx = p.x; p.ty = p.y;
+          this.spawnWave(p.x, p.y, 180, "#7ee87a", 0, 20, 0.5);
+          this.addLight(p.x, p.y, 260, 0.4);
+          this.announce(`${p.hero.name} ВОСКРЕС`, "союзник вернул его в бой!");
+          if (coop) this.net?.sendEv({ t: "ann", x: `${p.hero.name} ВОСКРЕС`, s: "союзник вернул его в бой!" });
+          this.audio.sfx("win");
         }
       }
       if (this.players.length > 0 && this.players.every((p) => !p.alive)) { this.gameOver(); return; }
@@ -1406,23 +1509,23 @@ export class Arpg {
     const dist = boss ? 600 : 560 + Math.random() * 320;
     const x = Math.max(60, Math.min(WORLD_SIZE - 60, anchor.x + Math.cos(ang) * dist));
     const y = Math.max(60, Math.min(WORLD_SIZE - 60, anchor.y + Math.sin(ang) * dist));
-    const pool = this.netMode !== "off" ? ALL_ENEMY_KINDS : this.map.enemies;
+    const pool = this.map === COOP_MAP ? ALL_ENEMY_KINDS : this.map.enemies;
     const kind = pool[Math.floor(Math.random() * pool.length)];
     if (boss) {
       let name = this.map.bossName;
       let color = this.map.bossColor;
       let sprite = this.enemySpriteId();
-      if (this.netMode !== "off") {
-        // кооп: боссы со всех карт выходят по очереди
+      if (this.map === COOP_MAP) {
+        // кооп на общей арене: боссы со всех карт выходят по очереди
         const cb = COOP_BOSSES[Math.floor((this.wave - 1) / 3) % COOP_BOSSES.length];
         name = cb.name; color = cb.color; sprite = cb.sprite;
       }
       this.enemies.push({
         x, y, kind, boss: true, name,
-        hp: 420 * this.hpMul, maxHp: 420 * this.hpMul,
-        speed: 72, dmg: 20 * this.dmgMulE, radius: 36, xp: 150,
+        hp: 620 * this.hpMul, maxHp: 620 * this.hpMul,
+        speed: 76, dmg: 26 * this.dmgMulE, radius: 38, xp: 250,
         attackCd: 0, shootCd: 2, burstCd: 4, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: 0, sprite, windup: 0, nid: this.nidSeq++,
+        anim: 0, sprite, windup: 0, nid: this.nidSeq++, telCd: 3, sumCd: 9,
         charmT: 0, burnT: 0, burnAcc: 0, burnDmg: 0,
       });
       this.announce(`БОСС: ${name}`, "постарайся выжить!");
@@ -1434,8 +1537,8 @@ export class Arpg {
         hp: kind.hp * this.hpMul, maxHp: kind.hp * this.hpMul,
         speed: kind.speed * (1 + (this.wave - 1) * 0.02), dmg: kind.dmg * this.dmgMulE,
         radius: kind.radius, xp: kind.xp,
-        attackCd: 0, shootCd: 1 + Math.random() * 1.5, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: Math.random() * 10, sprite: this.netMode !== "off" ? kindSprite(kind) : (kind.spriteVar ?? this.enemySpriteId()), windup: 0, nid: this.nidSeq++,
+        attackCd: 0, shootCd: 1 + Math.random() * 1.5, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0, telCd: 0, sumCd: 0,
+        anim: Math.random() * 10, sprite: this.map === COOP_MAP ? kindSprite(kind) : (kind.spriteVar ?? this.enemySpriteId()), windup: 0, nid: this.nidSeq++,
         charmT: 0, burnT: 0, burnAcc: 0, burnDmg: 0,
       });
     }
@@ -1518,6 +1621,20 @@ export class Arpg {
           }
         } else {
           if (d > e.radius + 22) { e.x += (dx / d) * e.speed * slow * dt; e.y += (dy / d) * e.speed * slow * dt; }
+          // скиллы босса: телеграф «кольца смерти» под целью и призыв миньонов
+          if (e.boss) {
+            e.telCd -= dt; e.sumCd -= dt;
+            if (e.telCd <= 0) {
+              e.telCd = 6.5;
+              this.telegraphs.push({ x: tgt.x, y: tgt.y, r: 150, t: 1.3, maxT: 1.3, dmg: e.dmg * 1.6, kind: "boss" });
+            }
+            if (e.sumCd <= 0 && this.enemies.length < 55) {
+              e.sumCd = 12;
+              this.spawnEnemy(false); this.spawnEnemy(false);
+              this.spawnParticles(e.x, e.y, 24, "#b04ae8", 280);
+              this.floaters.push({ x: e.x, y: e.y - 60, text: "ПРИЗЫВ!", color: "#b04ae8", life: 1 });
+            }
+          }
           if (e.boss && e.burstCd <= 0) {
             e.burstCd = 5;
             for (let k = 0; k < 8; k++) {
@@ -1601,6 +1718,7 @@ export class Arpg {
     if (e.nid !== undefined) this.enemyByNid.delete(e.nid);
     this.kills++;
     const killer = owner ?? this.me;
+    killer.kills++;
     killer.xp += e.xp;
     // хит-стоп: игра на мгновение замирает — убийство чувствуется весомым
     this.hitStop = Math.max(this.hitStop, e.boss ? 0.1 : 0.03);
@@ -1939,6 +2057,7 @@ export class Arpg {
         cr: +Math.max(0, p.cdR).toFixed(1), ct: +Math.max(0, p.cdT).toFixed(1), cf: +Math.max(0, p.cdF).toFixed(1),
         g: p.gold, pts: p.skillPts, sk: [p.sk.q, p.sk.e, p.sk.r, p.sk.t], bu: p.buys,
         ru: +Math.max(0, p.cdRushT).toFixed(1), bs: +Math.max(0, p.berserkT).toFixed(1), iv: +Math.max(0, p.invulnT).toFixed(1),
+        k: p.kills, rp: +p.reviveProg.toFixed(2),
       };
     }
     const en: SnapMsg["en"] = [];
@@ -1959,6 +2078,7 @@ export class Arpg {
       ws: this.waveState === "break" ? 1 : 0, bt: +this.breakT.toFixed(1),
       gold: this.golds.map((g) => [Math.round(g.x), Math.round(g.y), g.v]),
       loot: this.loots.map((l) => [Math.round(l.x), Math.round(l.y), l.kind]),
+      tel: this.telegraphs.map((tg) => [Math.round(tg.x), Math.round(tg.y), tg.r, +tg.t.toFixed(2), tg.kind === "meteor" ? 1 : 0]),
       pl, en, pr,
       orb: this.orbs.map((o) => [Math.round(o.x), Math.round(o.y)]),
       sat: this.satorus.map((s) => ({ p: s.pid, x: r1(s.x), y: r1(s.y), l: +s.life.toFixed(1) })),
@@ -1984,6 +2104,7 @@ export class Arpg {
     this.breakT = s.bt;
     this.golds = s.gold.map(([x, y, v]) => ({ x, y, v, t: 0 }));
     this.loots = s.loot.map(([x, y, kind]) => ({ x, y, kind: kind as LootKind, t: 0 }));
+    this.telegraphs = s.tel.map(([x, y, r, t2, kd]) => ({ x, y, r, t: t2, maxT: Math.max(t2, 0.4), dmg: 0, kind: kd === 1 ? "meteor" as const : "boss" as const }));
     // игроки
     for (const [pid, sp] of Object.entries(s.pl)) {
       let p = this.players.find((pl) => pl.pid === pid);
@@ -1999,6 +2120,7 @@ export class Arpg {
         const prevSk = p.sk;
         p.sk = { q: sp.sk[0], e: sp.sk[1], r: sp.sk[2], t: sp.sk[3] };
         p.cdRushT = sp.ru; p.berserkT = sp.bs; p.invulnT = sp.iv;
+        p.kills = sp.k; p.reviveProg = sp.rp;
         for (const k of ["q", "e", "r", "t"] as const) {
           if (p.sk[k] > prevSk[k]) {
             const nm = k === "t" ? p.hero.ult.name : p.hero[k].name;
@@ -2017,13 +2139,15 @@ export class Arpg {
           this.addLight(p.x, p.y, 300, 0.4);
           this.audio.sfx("win");
         }
-        if (this.prevAlive && !sp.al) { this.announce("ВЫ ПАЛИ", "команда сражается дальше"); this.audio.sfx("lose"); }
+        if (this.prevAlive && !sp.al) { this.announce("ВЫ ПАЛИ", "союзники могут воскресить тебя — или жди перерыва"); this.audio.sfx("lose"); }
+        if (!this.prevAlive && sp.al) { this.announce("ТЫ ВОСКРЕС", "вернись в бой!"); this.audio.sfx("win"); }
         this.prevAlive = sp.al;
         p.alive = sp.al;
       } else {
         p.tx = sp.x; p.ty = sp.y; p.facing = sp.fx; p.walkPhase = sp.wk; p.moving = sp.mv;
         p.hp = sp.hp; p.maxHp = sp.mh; p.level = sp.lv;
         p.shieldT = sp.sh; p.dashT = sp.da; p.swingT = sp.sw; p.alive = sp.al;
+        p.kills = sp.k; p.reviveProg = sp.rp;
         p.mountT = sp.mo; p.rageT = sp.rg; p.spinT = sp.spn;
       }
     }
@@ -2038,7 +2162,7 @@ export class Arpg {
           x: se.x, y: se.y, tx: se.x, ty: se.y, hp: se.hp, maxHp: se.mhp,
           kind, boss: se.b, name: se.b ? "" : kind.name,
           speed: kind.speed, dmg: kind.dmg, radius: se.b ? 36 : kind.radius, xp: kind.xp,
-          attackCd: 0, shootCd: 0, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
+          attackCd: 0, shootCd: 0, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0, telCd: 0, sumCd: 0,
           anim: Math.random() * 10, sprite: SPRITE_IDS[se.s] ?? "enemy-hockey", windup: 0, nid: se.i,
           charmT: se.c ? 3 : 0, burnT: 0, burnAcc: 0, burnDmg: 0,
         };
@@ -2143,6 +2267,10 @@ export class Arpg {
       this.spawnCastFx(d.h, d.k, d.x, d.y, d.dir);
     } else if (d.t === "boom") {
       this.rasenBoomFx(d.x, d.y);
+    } else if (d.t === "pause") {
+      this.netPaused = d.on;
+      this.announce(d.on ? "ПАУЗА" : "БОЙ ПРОДОЛЖАЕТСЯ", d.on ? "хост поставил паузу для всего лобби" : "");
+      this.audio.sfx("ui");
     } else if (d.t === "over") {
       this.overStats = { time: d.time, kills: d.kills, level: this.level, wave: d.wave };
       this.state = "over";
@@ -2350,7 +2478,7 @@ export class Arpg {
     this.enemies = []; this.waveSpawnLeft = 0;
   }
   debugInfo2(): Record<string, unknown> {
-    return { ws: this.waveState, bt: +this.breakT.toFixed(1), gold: this.me.gold, pts: this.me.skillPts, sk: this.me.sk, buys: this.me.buys, shop: this.shopOpen };
+    return { ws: this.waveState, bt: +this.breakT.toFixed(1), gold: this.me.gold, pts: this.me.skillPts, sk: this.me.sk, buys: this.me.buys, shop: this.shopOpen, tg: this.telegraphs.length, kills: this.me.kills, paused: this.netPaused, met: this.meteorAnnounced };
   }
   debugInfo(): Record<string, unknown> {
     return {
@@ -2434,6 +2562,23 @@ export class Arpg {
       ctx.lineWidth = 1.5;
       ctx.strokeRect(-7, -7, 14, 14);
       ctx.restore();
+    }
+
+    // телеграфы: красные зоны метеоритов и атак боссов
+    for (const tg of this.telegraphs) {
+      const tx2 = tg.x - camX, ty2 = tg.y - camY;
+      if (tx2 < -tg.r - 40 || tx2 > this.w + tg.r + 40 || ty2 < -tg.r - 40 || ty2 > this.h + tg.r + 40) continue;
+      const prog = Math.max(0, Math.min(1, 1 - tg.t / tg.maxT));
+      ctx.globalAlpha = 0.22 + 0.12 * Math.sin(this.time * 10);
+      ctx.fillStyle = tg.kind === "meteor" ? "#ff6a2c" : "#e83c3c";
+      ctx.beginPath(); ctx.arc(tx2, ty2, tg.r, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = tg.kind === "meteor" ? "#ffb02e" : "#ff5a3c";
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(tx2, ty2, tg.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(tx2, ty2, Math.max(4, tg.r * (1 - prog)), 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
     }
 
     // трупы врагов — падают и растворяются
@@ -3040,6 +3185,22 @@ export class Arpg {
       ctx.fillStyle = "#c8352a";
       ctx.font = "bold 12px Georgia";
       ctx.fillText("ПАЛ", x, y - 80);
+      if (this.netMode !== "off") {
+        if (p.reviveProg > 0) {
+          ctx.strokeStyle = "#7ee87a";
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(x, y - 30, 26, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p.reviveProg);
+          ctx.stroke();
+          ctx.fillStyle = "#7ee87a";
+          ctx.font = "11px Georgia";
+          ctx.fillText("воскрешение…", x, y - 94);
+        } else {
+          ctx.fillStyle = "rgba(126,232,122,0.55)";
+          ctx.font = "11px Georgia";
+          ctx.fillText("встань рядом — воскресишь", x, y - 94);
+        }
+      }
     }
   }
 
@@ -3224,19 +3385,24 @@ export class Arpg {
     if (this.netMode !== "off") {
       ctx.textAlign = "left";
       let ty = 20;
-      for (const p of this.players) {
+      ctx.fillStyle = "rgba(232,217,176,0.55)";
+      ctx.font = "bold 11px Georgia";
+      ctx.fillText("ЛИДЕРБОРД (убийства)", 16, ty - 2);
+      ty += 16;
+      const ranked = [...this.players].sort((a, b) => b.kills - a.kills);
+      for (const p of ranked) {
         ctx.fillStyle = "rgba(10,8,6,0.72)";
-        ctx.fillRect(14, ty - 13, 190, 30);
+        ctx.fillRect(14, ty - 13, 220, 30);
         ctx.strokeStyle = p.isLocal ? "#c9a15a" : "#4a3f32";
         ctx.lineWidth = 1.5;
-        ctx.strokeRect(14, ty - 13, 190, 30);
+        ctx.strokeRect(14, ty - 13, 220, 30);
         ctx.fillStyle = p.alive ? "#f0e6d0" : "#7a7066";
         ctx.font = "bold 12px Georgia";
-        ctx.fillText(`${p.hero.name}${p.isLocal ? " (ты)" : ""} • ${p.level}`, 22, ty + 6);
+        ctx.fillText(`${p.hero.name}${p.isLocal ? " (ты)" : ""} • ${p.level} • \u2620${p.kills}`, 22, ty + 6);
         ctx.fillStyle = "rgba(0,0,0,0.6)";
-        ctx.fillRect(120, ty - 6, 72, 7);
+        ctx.fillRect(150, ty - 6, 72, 7);
         ctx.fillStyle = p.alive ? "#5ee87a" : "#5a2020";
-        ctx.fillRect(120, ty - 6, 72 * Math.max(0, p.hp / p.maxHp), 7);
+        ctx.fillRect(150, ty - 6, 72 * Math.max(0, p.hp / p.maxHp), 7);
         ty += 38;
       }
       ctx.textAlign = "center";
@@ -3420,6 +3586,17 @@ export class Arpg {
       ctx.fillText("ПАУЗА", w / 2, h / 2 - 10);
       ctx.font = "18px Georgia";
       ctx.fillText("Esc — продолжить", w / 2, h / 2 + 30);
+    }
+
+    if (this.netPaused && this.state === "play") {
+      ctx.fillStyle = "rgba(0,0,0,0.65)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e8d9b0";
+      ctx.font = "bold 44px Georgia";
+      ctx.fillText("ПАУЗА", w / 2, h / 2 - 10);
+      ctx.font = "18px Georgia";
+      ctx.fillText(this.netMode === "host" ? "Esc — снять паузу" : "хост поставил паузу для всего лобби", w / 2, h / 2 + 30);
     }
   }
 
@@ -3730,11 +3907,22 @@ export class Arpg {
       ctx.fillText(`${hh.name} — ${hh.title}${lp.host ? " 👑" : ""}${lp.pid === this.myPid ? " (ты)" : ""}`, w / 2, y);
     }
 
+    // выбранная карта
+    const lobbyMapName = this.lobbyMap === "coop" ? "ВСЕ АРЕНЫ (враги со всех карт)" : ((MAPS as Record<string, MapDef>)[this.lobbyMap]?.name ?? this.lobbyMap);
+    ctx.fillStyle = "#e8d9b0";
+    ctx.font = "bold 18px Georgia";
+    ctx.fillText(`Карта: ${lobbyMapName}`, w / 2, 268 + list.length * 34 + 4);
+    if (this.netMode === "host") {
+      ctx.fillStyle = "#8f8272";
+      ctx.font = "13px Georgia";
+      ctx.fillText("← → — сменить карту", w / 2, 268 + list.length * 34 + 24);
+    }
+
     // выбор героя — те же карточки, компактно
     const cw = 150, ch = 190, gap = 18;
     const total = HEROES.length * (cw + gap) - gap;
     const x0 = w / 2 - total / 2;
-    const y0 = 268 + list.length * 34 + 24;
+    const y0 = 268 + list.length * 34 + 44;
     this.cardRects = [];
     for (let i = 0; i < HEROES.length; i++) {
       const hero = HEROES[i];
