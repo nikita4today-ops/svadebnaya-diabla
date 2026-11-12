@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.ghtoken.json
+verification-shots/
+site-bundle.zip
