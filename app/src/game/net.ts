@@ -22,6 +22,8 @@ export interface StartMsg { pl: LobbyPlayer[] }
 export interface HeroMsg { hero: string }
 export interface InpMsg { x: number; y: number; fx: number; wk: number; mv: boolean }
 export interface CastMsg { k: string; dir: number }
+/** Запрос клиента хосту: прокачка навыка (k="skillup", v=0..3 → q/e/r/t) или покупка (k="buy", v=слот). */
+export interface ReqMsg { k: string; v: number }
 
 /** Игрок в снапшоте (компактные ключи — снапшоты идут 10 раз в секунду). */
 export interface SnapPlayer {
@@ -31,6 +33,10 @@ export interface SnapPlayer {
   /** Маунт, ярость, кручение — для визуала и скорости на клиенте. */
   mo: number; rg: number; spn: number;
   cb: number; cq: number; ce: number; cr: number; ct: number; cf: number;
+  /** Золото, очки навыков, уровни скиллов [q,e,r,t], покупки в магазине. */
+  g: number; pts: number; sk: number[]; bu: number[];
+  /** Временные бонусы из лута: рапира (без перезарядки), берсерк, эгида. */
+  ru: number; bs: number; iv: number;
 }
 export interface SnapEnemy { i: number; k: number; s: number; x: number; y: number; hp: number; mhp: number; b: boolean; w: boolean; c: boolean }
 export interface SnapProj { i: number; k: string; x: number; y: number; vx: number; vy: number; r: number; c: string; f: boolean }
@@ -39,9 +45,13 @@ export interface SnapClone { x: number; y: number; wk: number }
 export interface SnapDragon { x: number; y: number; ang: number }
 export interface SnapMsg {
   t: number; wave: number; kills: number;
+  /** Фаза волны: 0 — бой, 1 — перерыв; bt — остаток перерыва. */
+  ws: number; bt: number;
   pl: Record<string, SnapPlayer>;
   en: SnapEnemy[]; pr: SnapProj[]; orb: number[][]; sat: SnapSatoru[];
   cl: SnapClone[]; dr: SnapDragon[];
+  /** Золото [x,y] и лут [x,y,kind] на земле. */
+  gold: number[][]; loot: Array<[number, number, string]>;
 }
 
 export type EvMsg =
@@ -62,6 +72,7 @@ export class Net {
   private inpH: Handler<InpMsg>[] = [];
   private castH: Handler<CastMsg>[] = [];
   private snapH: Handler<SnapMsg>[] = [];
+  private reqH: Handler<ReqMsg>[] = [];
   private evH: Handler<EvMsg>[] = [];
   private joinH: ((pid: string) => void)[] = [];
   private leaveH: ((pid: string) => void)[] = [];
@@ -83,6 +94,7 @@ export class Net {
     const inp = wire<InpMsg>("inp", this.inpH);
     const cast = wire<CastMsg>("cast", this.castH);
     const snap = wire<SnapMsg>("snap", this.snapH);
+    const req = wire<ReqMsg>("req", this.reqH);
     const ev = wire<EvMsg>("ev", this.evH);
     this.sendLobby = (d) => { lobby.send(d).catch(() => {}); };
     this.sendStart = (d) => { start.send(d).catch(() => {}); };
@@ -90,6 +102,7 @@ export class Net {
     this.sendInp = (d, to) => { inp.send(d, { target: to }).catch(() => {}); };
     this.sendCast = (d, to) => { cast.send(d, { target: to }).catch(() => {}); };
     this.sendSnap = (d) => { snap.send(d).catch(() => {}); };
+    this.sendReq = (d, to) => { req.send(d, { target: to }).catch(() => {}); };
     this.sendEv = (d) => { ev.send(d).catch(() => {}); };
 
     this.room.onPeerJoin((ctx) => { for (const h of this.joinH) h(ctx.peerId); });
@@ -102,6 +115,7 @@ export class Net {
   sendInp: (d: InpMsg, to: string) => void;
   sendCast: (d: CastMsg, to: string) => void;
   sendSnap: (d: SnapMsg) => void;
+  sendReq: (d: ReqMsg, to: string) => void;
   sendEv: (d: EvMsg) => void;
 
   onLobby(h: Handler<LobbyMsg>): void { this.lobbyH.push(h); }
@@ -110,6 +124,7 @@ export class Net {
   onInp(h: Handler<InpMsg>): void { this.inpH.push(h); }
   onCast(h: Handler<CastMsg>): void { this.castH.push(h); }
   onSnap(h: Handler<SnapMsg>): void { this.snapH.push(h); }
+  onReq(h: Handler<ReqMsg>): void { this.reqH.push(h); }
   onEv(h: Handler<EvMsg>): void { this.evH.push(h); }
   onPeerJoin(h: (pid: string) => void): void { this.joinH.push(h); }
   onPeerLeave(h: (pid: string) => void): void { this.leaveH.push(h); }

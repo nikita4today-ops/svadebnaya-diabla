@@ -216,6 +216,38 @@ export const WAVE_PERIOD = 30; // каждые 30 секунд врагов бо
 export const BOSS_PERIOD = 90;
 export const SATORU_DURATION = 12;
 
+/** Перерыв между волнами (сек): время на прокачку и магазин. */
+export const BREAK_DURATION = 15;
+
+/** Максимальный уровень навыка. */
+export const SKILL_MAX = 10;
+/** Уровень героя, с которого открывается ультимейт (как в Dota 2). */
+export const ULT_UNLOCK_LEVEL = 6;
+
+/** Магазин экипировки: покупки в перерыве между волнами (клавиша B). */
+export interface ShopItem { name: string; desc: string; base: number; icon: string }
+export const SHOP: ShopItem[] = [
+  { name: "Сердце титана", desc: "+40 к макс. здоровью и полное лечение", base: 40, icon: "♥" },
+  { name: "Острый клинок", desc: "+15% к урону атаки", base: 50, icon: "⚔" },
+  { name: "Фолиант чар", desc: "+15% к урону навыков", base: 50, icon: "✦" },
+  { name: "Сапоги-скороходы", desc: "+10% к скорости передвижения", base: 40, icon: "≫" },
+  { name: "Песочные часы", desc: "−10% к перезарядке навыков", base: 60, icon: "◷" },
+  { name: "Латный доспех", desc: "−12% входящего урона", base: 60, icon: "⛉" },
+];
+/** Цена следующей покупки предмета i, если таких уже куплено n. */
+export function shopPrice(i: number, n: number): number {
+  return Math.round(SHOP[i].base * Math.pow(1.6, n) / 5) * 5;
+}
+
+/** Лут, выпадающий из врагов с некоторой вероятностью. */
+export type LootKind = "rush" | "berserk" | "aegis" | "mana";
+export const LOOT: Record<LootKind, { name: string; color: string; desc: string }> = {
+  rush: { name: "Перчатка рапиры", color: "#7ec8ff", desc: "15 сек навыки без перезарядки" },
+  berserk: { name: "Зелье берсерка", color: "#ff5a3c", desc: "+50% урона на 12 сек" },
+  aegis: { name: "Эгида", color: "#ffd24a", desc: "5 сек неуязвимости" },
+  mana: { name: "Синее зелье", color: "#5aa8ff", desc: "мана полностью восстановлена" },
+};
+
 /** Базовый спрайт вида врага (если нет предзапечённого варианта). */
 export function kindSprite(k: EnemyKindDef): string {
   return k.spriteVar ?? ({

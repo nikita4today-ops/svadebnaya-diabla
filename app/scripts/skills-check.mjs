@@ -58,7 +58,11 @@ for (let h = 0; h < 4; h++) {
   await page.keyboard.press("KeyR");
   await page.waitForTimeout(500);
   await page.screenshot({ path: join(SHOTS, `mount-${NAMES[h]}.png`) });
-  // ультимейт T
+  // ультимейт T (открывается с 6 уровня — ап уровня и прокачка)
+  await page.evaluate(() => { for (let i = 0; i < 5; i++) window.__debug.lvl(); });
+  await page.waitForTimeout(400);
+  await page.keyboard.press("Digit4");
+  await page.waitForTimeout(200);
   await page.evaluate(() => window.__debug && window.__debug.heal());
   await page.keyboard.press("KeyT");
   await page.waitForTimeout(600);

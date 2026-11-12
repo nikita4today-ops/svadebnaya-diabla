@@ -29,7 +29,11 @@ export function startGame(canvas: HTMLCanvasElement): void {
   (window as unknown as { __debug?: Record<string, () => void> }).__debug = {
     boss: () => game.debugBoss(),
     heal: () => game.debugHeal(),
+    gold: () => game.debugGold(),
+    wave: () => game.debugWave(),
+    lvl: () => game.debugLvl(),
   };
+  (window as unknown as { __dbg2?: () => unknown }).__dbg2 = () => game.debugInfo2();
   (window as unknown as { __dbg?: () => unknown }).__dbg = () => game.debugInfo();
   // первый отрисованный кадр — страница играбельна
   const markReady = () => {
