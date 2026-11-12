@@ -43,6 +43,8 @@ interface Enemy {
   attackCd: number; shootCd: number; burstCd: number;
   flash: number; disarmT: number; kx: number; ky: number;
   anim: number; sprite: string;
+  /** Замах перед ударом: >0 — идёт телеграф атаки, урон при достижении 0. */
+  windup: number;
 }
 
 interface Corpse { x: number; y: number; sprite: string; life: number; flip: boolean; scale: number }
@@ -58,6 +60,12 @@ interface Particle { x: number; y: number; vx: number; vy: number; life: number;
 interface Floater { x: number; y: number; text: string; color: string; life: number }
 interface Orb { x: number; y: number; heal: number; t: number }
 interface Announce { text: string; sub: string; life: number; max: number }
+/** Ударная волна: расширяющееся кольцо; если dmg > 0 — наносит урон один раз каждому врагу в кольце. */
+interface WaveFx { x: number; y: number; r: number; maxR: number; life: number; maxLife: number; color: string; dmg: number; width: number; hitSet: Set<Enemy> | null }
+/** Временный источник света (вспышка взрыва/заклинания). */
+interface TempLight { x: number; y: number; r: number; life: number; maxLife: number }
+/** Отложенный залп (Даша, «Тотальный отстрел»). */
+interface Volley { t: number; ang0: number }
 
 const BEST_KEY = "svadebnaya-diabla.best.v1";
 type BestMap = Partial<Record<string, { time: number; kills: number; level: number }>>;
@@ -114,7 +122,11 @@ export class Arpg {
   private hp = 100; private maxHp = 100;
   private level = 1; private xp = 0; private xpNext = XP_BASE;
   private dmgMul = 1;
-  private cdBasic = 0; private cdQ = 0; private cdE = 0; private cdR = 0;
+  private cdBasic = 0; private cdQ = 0; private cdE = 0; private cdR = 0; private cdT = 0;
+  /** Хит-стоп: микрозамедление времени при убийствах (сочность ударов, как в Diablo). */
+  private hitStop = 0;
+  /** Инерция движения игрока. */
+  private pvx = 0; private pvy = 0;
   private mana = 100; private maxMana = 100;
   private dashT = 0; private dashDx = 0; private dashDy = 0; private dashDmgMul = 0; private dashHits = new Set<Enemy>();
   private iframes = 0; private shieldT = 0; private speedBuffT = 0;
@@ -131,6 +143,9 @@ export class Arpg {
   private projs: Proj[] = [];
   private particles: Particle[] = [];
   private floaters: Floater[] = [];
+  private waves: WaveFx[] = [];
+  private tempLights: TempLight[] = [];
+  private volleys: Volley[] = [];
   private orbs: Orb[] = [];
   private announces: Announce[] = [];
   private time = 0; private kills = 0;
@@ -275,11 +290,12 @@ export class Arpg {
     this.maxHp = hero.hp; this.hp = hero.hp;
     this.level = 1; this.xp = 0; this.xpNext = XP_BASE;
     this.dmgMul = 1;
-    this.cdBasic = this.cdQ = this.cdE = this.cdR = 0;
+    this.cdBasic = this.cdQ = this.cdE = this.cdR = this.cdT = 0;
     this.mana = this.maxMana;
     this.dashT = 0; this.iframes = 0; this.shieldT = 0; this.speedBuffT = 0;
+    this.hitStop = 0; this.pvx = 0; this.pvy = 0;
     this.enemies = []; this.projs = []; this.particles = []; this.floaters = []; this.orbs = [];
-    this.decals = [];
+    this.decals = []; this.waves = []; this.tempLights = []; this.volleys = [];
     this.time = 0; this.kills = 0;
     this.wave = 1; this.hpMul = 1; this.dmgMulE = 1;
     this.spawnT = 0.5; this.nextBossAt = BOSS_PERIOD; this.bossAlive = false;
@@ -330,6 +346,9 @@ export class Arpg {
     }
     if (this.state === "pause") return;
 
+    // хит-стоп: микрозамедление при убийствах (удар чувствуется весомым)
+    if (this.hitStop > 0) { this.hitStop -= dt; dt *= 0.12; }
+
     this.time += dt;
 
     // волны: каждые WAVE_PERIOD секунд врагов больше и они сильнее
@@ -343,7 +362,7 @@ export class Arpg {
     }
 
     // таймеры игрока
-    this.cdBasic -= dt; this.cdQ -= dt; this.cdE -= dt; this.cdR -= dt;
+    this.cdBasic -= dt; this.cdQ -= dt; this.cdE -= dt; this.cdR -= dt; this.cdT -= dt;
     this.mana = Math.min(this.maxMana, this.mana + 9 * dt);
     this.iframes -= dt; this.shieldT -= dt; this.speedBuffT -= dt;
     this.swingT -= dt; this.hurtFlash -= dt;
@@ -363,6 +382,7 @@ export class Arpg {
       const dsp = this.hero.id === "maxim" ? 1050 : this.hero.id === "nikita" ? 900 : 820;
       this.px += this.dashDx * dsp * dt;
       this.py += this.dashDy * dsp * dt;
+      this.pvx = this.dashDx * dsp; this.pvy = this.dashDy * dsp;
       if (this.dashDmgMul > 0) {
         for (const e of this.enemies) {
           if (this.dashHits.has(e)) continue;
@@ -377,9 +397,16 @@ export class Arpg {
     } else {
       const ix = this.input.moveX, iz = this.input.moveZ;
       const len = Math.hypot(ix, iz) || 1;
-      moving = Math.abs(ix) + Math.abs(iz) > 0;
-      this.px += (ix / len) * sp * dt * (moving ? 1 : 0);
-      this.py += (-iz / len) * sp * dt * (moving ? 1 : 0);
+      const want = Math.abs(ix) + Math.abs(iz) > 0;
+      const tx = (ix / len) * sp * (want ? 1 : 0);
+      const ty = (-iz / len) * sp * (want ? 1 : 0);
+      // инерция: разгон и торможение занимают ~0.09 секунды
+      const k = Math.min(1, dt * 14);
+      this.pvx += (tx - this.pvx) * k;
+      this.pvy += (ty - this.pvy) * k;
+      this.px += this.pvx * dt;
+      this.py += this.pvy * dt;
+      moving = want || Math.hypot(this.pvx, this.pvy) > 14;
     }
     if (moving) this.walkPhase += dt * (this.dashT > 0 ? 2.2 : 1);
     this.px = Math.max(40, Math.min(WORLD_SIZE - 40, this.px));
@@ -389,7 +416,8 @@ export class Arpg {
     if (this.mouseDown && this.cdBasic <= 0 && this.dashT <= 0) this.basicAttack();
     if (this.input.consumeAction("KeyQ") && this.cdQ <= 0) this.castQ();
     if (this.input.consumeAction("KeyE") && this.cdE <= 0) this.castE();
-    if ((this.input.consumeAction("KeyR") || this.input.consumeAction("KeyF")) && this.cdR <= 0) this.castSatoru();
+    if (this.input.consumeAction("KeyR") && this.cdR <= 0) this.castR();
+    if ((this.input.consumeAction("KeyT") || this.input.consumeAction("KeyF")) && this.cdT <= 0) this.castSatoru();
 
     // спавн
     const cap = Math.min(70, 6 + this.wave * 3);
@@ -435,6 +463,8 @@ export class Arpg {
       this.hp = Math.min(this.maxHp, this.hp + this.maxHp * 0.35);
       this.announce(`УРОВЕНЬ ${this.level}!`, "удары стали мощнее");
       this.spawnParticles(this.px, this.py, 40, "#ffd24a", 320);
+      this.spawnWave(this.px, this.py, 200, "#ffd24a", 0, 18, 0.5);
+      this.addLight(this.px, this.py, 300, 0.4);
       this.audio.sfx("win");
     }
 
@@ -514,6 +544,8 @@ export class Arpg {
       }
       this.spawnParticles(this.px, this.py, 36, "#7ec8ff", 380);
       this.spawnParticles(this.px, this.py, 16, "#ffffff", 260);
+      this.spawnWave(this.px, this.py, 190, "#7ec8ff", 0, 20, 0.4);
+      this.addLight(this.px, this.py, 260, 0.25);
       this.shake = Math.min(14, this.shake + 8);
       this.audio.sfx("explosion");
     } else if (this.hero.id === "dasha") {
@@ -574,11 +606,71 @@ export class Arpg {
   }
 
   private castSatoru(): void {
-    this.cdR = this.hero.ult.cooldown;
+    this.cdT = this.hero.ult.cooldown;
     this.satoru = { x: this.px - 60, y: this.py - 60, life: SATORU_DURATION, swipeCd: 0 };
     this.announce("САТОРУ В ДЕЛЕ!", "кот пришёл на помощь");
     this.spawnParticles(this.px, this.py - 40, 24, "#e8e8e8", 240);
     this.audio.sfx("win");
+  }
+
+  /** Ударная волна: зрелищное кольцо; при dmg > 0 бьёт каждого врага один раз. */
+  private spawnWave(x: number, y: number, maxR: number, color: string, dmg = 0, width = 26, dur = 0.45): void {
+    this.waves.push({ x, y, r: 10, maxR, life: dur, maxLife: dur, color, dmg, width, hitSet: dmg > 0 ? new Set() : null });
+  }
+
+  /** Вспышка света на слое освещения (взрывы, заклинания). */
+  private addLight(x: number, y: number, r: number, life = 0.25): void {
+    if (this.tempLights.length < 12) this.tempLights.push({ x, y, r, life, maxLife: life });
+  }
+
+  /** Массовый ультимейт (клавиша R) — у каждого героя свой. */
+  private castR(): void {
+    if (this.mana < 60) {
+      this.floaters.push({ x: this.px, y: this.py - 34, text: "НЕТ МАНЫ", color: "#5aa8ff", life: 0.7 });
+      return;
+    }
+    this.mana -= 60;
+    this.cdR = this.hero.r.cooldown;
+    this.swingT = 0.3;
+    const dir = this.facing;
+    if (this.hero.id === "nikita") {
+      // «Шайбоград»: 14 взрывных шайб во все стороны
+      for (let k = 0; k < 14; k++) {
+        const a = (k / 14) * Math.PI * 2 + 0.13;
+        this.projs.push({
+          x: this.px + Math.cos(a) * 34, y: this.py + Math.sin(a) * 34,
+          vx: Math.cos(a) * 950, vy: Math.sin(a) * 950,
+          dmg: this.basicDmg() * 2.2, r: 9, friendly: true, pierce: true,
+          life: 1.0, color: "#1a1a1a", kind: "puck", disarm: false, hitSet: new Set(),
+        });
+      }
+      this.spawnWave(this.px, this.py, 240, "#7ec8ff", 0, 22, 0.5);
+      this.addLight(this.px, this.py, 320, 0.3);
+      this.shake = Math.min(18, this.shake + 10);
+      this.audio.sfx("explosion");
+    } else if (this.hero.id === "maxim") {
+      // «Расен-сюрикен»: гигантская сфера летит в точку прицела и взрывается
+      this.projs.push({
+        x: this.px + Math.cos(dir) * 40, y: this.py + Math.sin(dir) * 40,
+        vx: Math.cos(dir) * 780, vy: Math.sin(dir) * 780,
+        dmg: this.basicDmg() * 1.4, r: 26, friendly: true, pierce: true,
+        life: 0.85, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(),
+      });
+      this.audio.sfx("explosion");
+    } else if (this.hero.id === "dasha") {
+      // «Тотальный отстрел»: три круговых залпа по 16 пуль
+      this.volleys.push({ t: 0, ang0: 0 }, { t: 0.16, ang0: Math.PI / 16 }, { t: 0.32, ang0: -Math.PI / 16 });
+      this.addLight(this.px, this.py, 260, 0.2);
+      this.audio.sfx("hit");
+    } else {
+      // «Волна Авады»: зелёная волна смерти, бьёт всех по пути
+      this.spawnWave(this.px, this.py, 430, "#3ddc84", this.basicDmg() * 4.5, 36, 0.7);
+      this.spawnWave(this.px, this.py, 300, "#b0ffd0", 0, 18, 0.55);
+      this.spawnParticles(this.px, this.py, 40, "#3ddc84", 380);
+      this.addLight(this.px, this.py, 430, 0.5);
+      this.shake = Math.min(20, this.shake + 12);
+      this.audio.sfx("explosion");
+    }
   }
 
   // ---------- враги ----------
@@ -596,7 +688,7 @@ export class Arpg {
         hp: 420 * this.hpMul, maxHp: 420 * this.hpMul,
         speed: 72, dmg: 20 * this.dmgMulE, radius: 36, xp: 150,
         attackCd: 0, shootCd: 2, burstCd: 4, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: 0, sprite: this.enemySpriteId(),
+        anim: 0, sprite: this.enemySpriteId(), windup: 0,
       });
     } else {
       this.enemies.push({
@@ -605,7 +697,7 @@ export class Arpg {
         speed: kind.speed * (1 + (this.wave - 1) * 0.02), dmg: kind.dmg * this.dmgMulE,
         radius: kind.radius, xp: kind.xp,
         attackCd: 0, shootCd: 1 + Math.random() * 1.5, burstCd: 0, flash: 0, disarmT: 0, kx: 0, ky: 0,
-        anim: Math.random() * 10, sprite: kind.spriteVar ?? this.enemySpriteId(),
+        anim: Math.random() * 10, sprite: kind.spriteVar ?? this.enemySpriteId(), windup: 0,
       });
     }
   }
@@ -623,7 +715,11 @@ export class Arpg {
       const dx = this.px - e.x, dy = this.py - e.y;
       const d = Math.hypot(dx, dy) || 1;
       const slow = e.disarmT > 0 ? 0.5 : 1;
-      if (e.disarmT <= 0) {
+      if (e.windup > 0) {
+        // замах: враг замирает, затем бьёт, если цель ещё рядом
+        e.windup -= dt;
+        if (e.windup <= 0 && d < e.radius + 36) this.hurtPlayer(e.dmg);
+      } else if (e.disarmT <= 0) {
         if (e.kind.ranged && !e.boss) {
           if (d > 320) { e.x += (dx / d) * e.speed * slow * dt; e.y += (dy / d) * e.speed * slow * dt; }
           else if (d < 220) { e.x -= (dx / d) * e.speed * 0.7 * dt; e.y -= (dy / d) * e.speed * 0.7 * dt; }
@@ -649,14 +745,31 @@ export class Arpg {
             }
           }
         }
-        // контактный урон
+        // контактный урон: сначала замах (телеграф), потом сам удар
         if (d < e.radius + 24 && e.attackCd <= 0) {
           e.attackCd = 1.0;
-          this.hurtPlayer(e.dmg);
+          e.windup = e.boss ? 0.42 : 0.3;
         }
       }
       e.x = Math.max(30, Math.min(WORLD_SIZE - 30, e.x));
       e.y = Math.max(30, Math.min(WORLD_SIZE - 30, e.y));
+    }
+    // рассредоточение: враги отталкиваются друг от друга и не слипаются в один спрайт
+    const list = this.enemies;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const rr = a.radius + b.radius + 4;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0.01 && d2 < rr * rr) {
+          const d = Math.sqrt(d2);
+          const push = ((rr - d) / d) * 0.5 * Math.min(1, dt * 12);
+          a.x -= dx * push; a.y -= dy * push;
+          b.x += dx * push; b.y += dy * push;
+        }
+      }
     }
   }
 
@@ -694,6 +807,8 @@ export class Arpg {
     if (idx >= 0) this.enemies.splice(idx, 1);
     this.kills++;
     this.xp += e.xp;
+    // хит-стоп: игра на мгновение замирает — убийство чувствуется весомым
+    this.hitStop = Math.max(this.hitStop, e.boss ? 0.1 : 0.03);
     // труп падает и растворяется
     this.corpses.push({
       x: e.x, y: e.y, sprite: e.sprite,
@@ -708,6 +823,9 @@ export class Arpg {
     if (e.boss) {
       this.announce(`${e.name} ПОВЕРЖЕН!`, "+150 XP и сферы здоровья");
       for (let k = 0; k < 3; k++) this.orbs.push({ x: e.x + (k - 1) * 40, y: e.y + 30, heal: 25, t: 0 });
+      this.spawnWave(e.x, e.y, 260, "#ffd24a", 0, 22, 0.6);
+      this.addLight(e.x, e.y, 360, 0.5);
+      this.shake = Math.min(20, this.shake + 12);
       this.audio.sfx("win");
     } else {
       if (Math.random() < 0.26) this.orbs.push({ x: e.x, y: e.y, heal: 15, t: 0 });
@@ -738,7 +856,16 @@ export class Arpg {
         }
       }
       if (dead) {
-        if (p.kind !== "bullet") this.spawnParticles(p.x, p.y, 3, p.color, 120);
+        if (p.kind === "rasenshuriken") {
+          // взрыв Расен-сюрикена: огромная волна чакры
+          this.spawnWave(p.x, p.y, 330, "#7ec8ff", this.basicDmg() * 5, 34, 0.55);
+          this.spawnWave(p.x, p.y, 210, "#ffffff", 0, 16, 0.4);
+          this.spawnParticles(p.x, p.y, 36, "#7ec8ff", 420);
+          this.spawnParticles(p.x, p.y, 14, "#ffffff", 300);
+          this.addLight(p.x, p.y, 400, 0.4);
+          this.shake = Math.min(20, this.shake + 12);
+          this.audio.sfx("explosion");
+        } else if (p.kind !== "bullet") this.spawnParticles(p.x, p.y, 3, p.color, 120);
         this.projs.splice(i, 1);
       }
     }
@@ -781,6 +908,49 @@ export class Arpg {
   }
 
   private updateFx(dt: number): void {
+    // ударные волны
+    for (let i = this.waves.length - 1; i >= 0; i--) {
+      const wv = this.waves[i];
+      wv.life -= dt;
+      const t = 1 - Math.max(0, wv.life / wv.maxLife);
+      wv.r = 10 + (wv.maxR - 10) * (1 - Math.pow(1 - t, 2.2));
+      if (wv.dmg > 0 && wv.hitSet) {
+        for (const e of this.enemies) {
+          if (wv.hitSet.has(e)) continue;
+          const d = Math.hypot(e.x - wv.x, e.y - wv.y);
+          if (Math.abs(d - wv.r) < wv.width + e.radius) {
+            wv.hitSet.add(e);
+            const ang = Math.atan2(e.y - wv.y, e.x - wv.x);
+            this.damageEnemy(e, wv.dmg, Math.cos(ang) * 300, Math.sin(ang) * 300);
+          }
+        }
+      }
+      if (wv.life <= 0) this.waves.splice(i, 1);
+    }
+    // временные источники света
+    for (let i = this.tempLights.length - 1; i >= 0; i--) {
+      this.tempLights[i].life -= dt;
+      if (this.tempLights[i].life <= 0) this.tempLights.splice(i, 1);
+    }
+    // отложенные залпы («Тотальный отстрел» Даши)
+    for (let i = this.volleys.length - 1; i >= 0; i--) {
+      const v = this.volleys[i];
+      v.t -= dt;
+      if (v.t > 0) continue;
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * Math.PI * 2 + v.ang0;
+        this.projs.push({
+          x: this.px + Math.cos(a) * 30, y: this.py + Math.sin(a) * 30,
+          vx: Math.cos(a) * 900, vy: Math.sin(a) * 900,
+          dmg: this.basicDmg() * 1.1, r: 4, friendly: true, pierce: false,
+          life: 0.65, color: "#ffb02e", kind: "bullet", disarm: false, hitSet: null,
+        });
+      }
+      this.spawnParticles(this.px, this.py, 10, "#ffd24a", 260);
+      this.addLight(this.px, this.py, 240, 0.15);
+      this.audio.sfx("hit");
+      this.volleys.splice(i, 1);
+    }
     for (let i = this.trail.length - 1; i >= 0; i--) {
       this.trail[i].life -= dt;
       if (this.trail[i].life <= 0) this.trail.splice(i, 1);
@@ -983,8 +1153,25 @@ export class Arpg {
         ctx.strokeStyle = "rgba(255,230,230,0.95)"; ctx.lineWidth = 4;
         ctx.beginPath(); ctx.moveTo(-40, 0); ctx.lineTo(6, 0); ctx.stroke();
         ctx.restore();
+      } else if (p.kind === "rasenshuriken") {
+        // гигантская крутящаяся сфера чакры с лезвиями
+        const rot = p.life * 18;
+        const gr = p.r * 2.2;
+        ctx.drawImage(this.glowSprite("rgba(126,200,255,0.95)"), x - gr, y - gr, gr * 2, gr * 2);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(rot);
+        ctx.fillStyle = "rgba(220,240,255,0.9)";
+        for (let k = 0; k < 4; k++) {
+          ctx.rotate(Math.PI / 2);
+          ctx.beginPath();
+          ctx.moveTo(0, 0); ctx.lineTo(p.r * 1.9, -5); ctx.lineTo(p.r * 1.9, 5);
+          ctx.closePath(); ctx.fill();
+        }
+        ctx.restore();
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath(); ctx.arc(x, y, p.r * 0.55, 0, Math.PI * 2); ctx.fill();
       } else {
-        // магический болт / вражеский сгусток: ядро + свечение + хвост
         const ang = Math.atan2(p.vy, p.vx);
         ctx.strokeStyle = p.color;
         ctx.globalAlpha = 0.4;
@@ -1017,6 +1204,22 @@ export class Arpg {
     ctx.globalAlpha = 1;
     this.perfSec[2] += performance.now() - tSec; tSec = performance.now();
 
+    // ударные волны (ультимейты, взрывы)
+    for (const wv of this.waves) {
+      const x = wv.x - camX, y = wv.y - camY;
+      if (x < -wv.maxR || x > this.w + wv.maxR || y < -wv.maxR || y > this.h + wv.maxR) continue;
+      const a = Math.max(0, wv.life / wv.maxLife);
+      ctx.globalAlpha = a * 0.35;
+      ctx.strokeStyle = wv.color;
+      ctx.lineWidth = wv.width * a * 2.4 + 4;
+      ctx.beginPath(); ctx.arc(x, y, wv.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = a * 0.95;
+      ctx.lineWidth = wv.width * a * 0.6 + 2;
+      ctx.strokeStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(x, y, wv.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
     if (!this.skipSec.has("light")) this.renderLighting(ctx, camX, camY);
     this.perfSec[3] += performance.now() - tSec; tSec = performance.now();
     if (!this.skipSec.has("hud")) this.renderHud(ctx);
@@ -1044,6 +1247,8 @@ export class Arpg {
     light(this.px - camX, this.py - camY, this.map.id === "arena" ? 240 : 300);
     if (this.satoru) light(this.satoru.x - camX, this.satoru.y - camY, 170, 0.9);
     for (const e of this.enemies) if (e.boss) light(e.x - camX, e.y - camY, 140, 0.8);
+    // вспышки взрывов и заклинаний
+    for (const tl of this.tempLights) light(tl.x - camX, tl.y - camY, tl.r, Math.min(1.1, (tl.life / tl.maxLife) * 1.2));
     // запечённая виньетка по краям экрана
     lc.globalCompositeOperation = "source-over";
     if (this.vignette) lc.drawImage(this.vignette, 0, 0, this.w, this.h);
@@ -1234,6 +1439,22 @@ export class Arpg {
 
     this.drawPuppet(ctx, "hero-" + this.hero.id, x, y + 26 + idleBob, 76, { flip, walk, filter, scalePulse: pulse, attackT });
 
+    // дуга замаха клюшкой (Никита): белый веер по направлению удара
+    if (this.hero.id === "nikita" && this.swingT > 0) {
+      const t = 1 - Math.min(1, this.swingT / 0.18);
+      const sweep = this.facing - 1.0 + t * 2.0;
+      ctx.globalAlpha = 0.85 * (1 - t);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 7;
+      ctx.lineCap = "round";
+      ctx.beginPath(); ctx.arc(x, y - 14, 64, sweep - 0.5, sweep); ctx.stroke();
+      ctx.globalAlpha = 0.4 * (1 - t);
+      ctx.lineWidth = 16;
+      ctx.strokeStyle = "#bfe4ff";
+      ctx.beginPath(); ctx.arc(x, y - 14, 60, sweep - 0.6, sweep); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
     // купол Протего
     if (this.shieldT > 0) {
       const a = 0.35 + Math.sin(this.time * 9) * 0.12;
@@ -1289,6 +1510,12 @@ export class Arpg {
     // тень
     ctx.fillStyle = "rgba(0,0,0,0.4)";
     ctx.beginPath(); ctx.ellipse(x, y + r * 0.9, r * 1.1 * scale, r * 0.4 * scale, 0, 0, Math.PI * 2); ctx.fill();
+    // телеграф замаха: красная пульсация под врагом перед ударом
+    if (e.windup > 0) {
+      ctx.globalAlpha = 0.3 + 0.25 * Math.sin(this.time * 30);
+      ctx.drawImage(this.glowSprite("rgba(255,60,40,0.9)"), x - r * 1.7, y - r * 1.7, r * 3.4, r * 3.4);
+      ctx.globalAlpha = 1;
+    }
     // аура босса
     if (e.boss) {
       ctx.globalAlpha = 0.9;
@@ -1467,9 +1694,10 @@ export class Arpg {
       { label: "ЛКМ", name: this.hero.basicName, cd: 0, max: 1 },
       { label: "Q", name: this.hero.q.name, cd: Math.max(0, this.cdQ), max: this.hero.q.cooldown },
       { label: "E", name: this.hero.e.name, cd: Math.max(0, this.cdE), max: this.hero.e.cooldown },
-      { label: "R", name: this.hero.ult.name, cd: Math.max(0, this.cdR), max: this.hero.ult.cooldown },
+      { label: "R", name: this.hero.r.name, cd: Math.max(0, this.cdR), max: this.hero.r.cooldown },
+      { label: "T", name: this.hero.ult.name, cd: Math.max(0, this.cdT), max: this.hero.ult.cooldown },
     ];
-    const sw = 62, gap = 12;
+    const sw = 56, gap = 10;
     const sx = w / 2 - (slots.length * (sw + gap) - gap) / 2;
     for (let i = 0; i < slots.length; i++) {
       const x = sx + i * (sw + gap), y = py + 30;
@@ -1506,7 +1734,7 @@ export class Arpg {
     ctx.textAlign = "right";
     ctx.fillStyle = "rgba(240,230,208,0.45)";
     ctx.font = "12px Georgia";
-    ctx.fillText("WASD — движение • Q/E — навыки (мана) • R — САТОРУ • Esc — пауза • M — звук", w - 20, h - 126);
+    ctx.fillText("WASD — движение • Q/E — навыки • R — ультимейт • T — САТОРУ • Esc — пауза • M — звук", w - 20, h - 126);
 
     if (this.state === "pause") {
       ctx.fillStyle = "rgba(0,0,0,0.65)";
@@ -1636,11 +1864,13 @@ export class Arpg {
       ctx.textAlign = "left";
       ctx.fillStyle = "#d8cbaa";
       ctx.font = "13px Georgia";
-      ctx.fillText(`ЛКМ — ${hero.basicName}`, x + 16, y0 + 272);
-      ctx.fillText(`Q — ${hero.q.name}`, x + 16, y0 + 294);
-      ctx.fillText(`E — ${hero.e.name}`, x + 16, y0 + 316);
+      ctx.fillText(`ЛКМ — ${hero.basicName}`, x + 16, y0 + 268);
+      ctx.fillText(`Q — ${hero.q.name}`, x + 16, y0 + 288);
+      ctx.fillText(`E — ${hero.e.name}`, x + 16, y0 + 308);
+      ctx.fillStyle = "#ff9a5a";
+      ctx.fillText(`R — ${hero.r.name}`, x + 16, y0 + 328);
       ctx.fillStyle = "#c9a15a";
-      ctx.fillText(`R — ${hero.ult.name}`, x + 16, y0 + 338);
+      ctx.fillText(`T — ${hero.ult.name}`, x + 16, y0 + 348);
       ctx.textAlign = "center";
 
       const best = this.best[hero.id];
@@ -1648,7 +1878,7 @@ export class Arpg {
       ctx.font = "12px Arial";
       ctx.fillText(
         best ? `рекорд: ${Math.floor(best.time / 60)}:${String(best.time % 60).padStart(2, "0")}, ${best.kills} уб., ур. ${best.level}` : "ещё не играл",
-        x + cw / 2, y0 + 366,
+        x + cw / 2, y0 + 372,
       );
       ctx.fillStyle = "#6f6578";
       ctx.font = "bold 13px Arial";

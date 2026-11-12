@@ -30,6 +30,9 @@ export interface HeroDef {
   themeColor: string;
   q: AbilityDef;
   e: AbilityDef;
+  /** Массовый ультимейт (клавиша R). */
+  r: AbilityDef;
+  /** Зов САТОРУ — пятый скилл (клавиша T). */
   ult: AbilityDef;
 }
 
@@ -64,7 +67,7 @@ export const WORLD_SIZE = 2600;
 
 const SATORU: AbilityDef = {
   name: "Зов САТОРУ",
-  keyLabel: "R",
+  keyLabel: "T",
   cooldown: 40,
   desc: "Кот САТОРУ прибегает и 12 секунд рвёт врагов когтями",
 };
@@ -87,6 +90,7 @@ export const HEROES: HeroDef[] = [
     themeColor: "#7ec8ff",
     q: { name: "Силовой бросок", keyLabel: "Q", cooldown: 5, desc: "Щелчок: шайба пробивает врагов насквозь" },
     e: { name: "Силовой приём", keyLabel: "E", cooldown: 7, desc: "Рывок вперёд, враги на пути отлетают" },
+    r: { name: "Шайбоград", keyLabel: "R", cooldown: 22, desc: "14 взрывных шайб во все стороны" },
     ult: SATORU,
   },
   {
@@ -106,6 +110,7 @@ export const HEROES: HeroDef[] = [
     themeColor: "#ffa03a",
     q: { name: "Расенган", keyLabel: "Q", cooldown: 6, desc: "Сфера чакры: взрыв вокруг и отброс врагов" },
     e: { name: "Чидори", keyLabel: "E", cooldown: 7, desc: "Молниеносный рывок сквозь врагов" },
+    r: { name: "Расен-сюрикен", keyLabel: "R", cooldown: 24, desc: "Гигантская сфера летит в цель и взрывается" },
     ult: SATORU,
   },
   {
@@ -125,6 +130,7 @@ export const HEROES: HeroDef[] = [
     themeColor: "#ffd24a",
     q: { name: "Веерный огонь", keyLabel: "Q", cooldown: 5, desc: "5 пуль веером по площади" },
     e: { name: "Боевой перекат", keyLabel: "E", cooldown: 6, desc: "Перекат с неуязвимостью и ускорением" },
+    r: { name: "Тотальный отстрел", keyLabel: "R", cooldown: 22, desc: "Три залпа пуль по кругу" },
     ult: SATORU,
   },
   {
@@ -144,6 +150,7 @@ export const HEROES: HeroDef[] = [
     themeColor: "#b58cff",
     q: { name: "Экспеллиармус", keyLabel: "Q", cooldown: 6, desc: "Луч: обезоруживает и замедляет врагов" },
     e: { name: "Протего", keyLabel: "E", cooldown: 10, desc: "Щит, блокирующий весь урон 3 секунды" },
+    r: { name: "Волна Авады", keyLabel: "R", cooldown: 26, desc: "Зелёная волна смерти расходится от героини" },
     ult: SATORU,
   },
 ];
