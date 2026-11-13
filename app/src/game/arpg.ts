@@ -1477,6 +1477,8 @@ export class Arpg {
         dmg: this.basicDmg(p) * 2.2 * this.skillAmp(p, "t"), r: 34, friendly: true, pierce: true,
         life: 0.95, color: "#7ec8ff", kind: "rasenshuriken", disarm: false, hitSet: new Set(), owner: p,
       });
+      this.spawnWave(p.x, p.y, 130, "#7ec8ff", 0, 16, 0.35);
+      this.spawnParticles(p.x, p.y, 20, "#9fd8ff", 260);
       this.addLight(p.x, p.y, 300, 0.3);
       this.audio.sfx("explosion");
     } else if (p.hero.id === "dasha") {
@@ -1487,11 +1489,14 @@ export class Arpg {
       p.leapToX = Math.max(40, Math.min(WORLD_SIZE - 40, p.x + Math.cos(dir) * dist));
       p.leapToY = Math.max(40, Math.min(WORLD_SIZE - 40, p.y + Math.sin(dir) * dist));
       p.iframes = 0.6;
+      this.spawnParticles(p.x, p.y, 16, "#c9b18a", 220);
       this.audio.sfx("hit");
     } else {
       // Огненный дракон: 5 секунд летает и испепеляет
       this.dragons.push({ x: p.x, y: p.y, t: 5 + 0.3 * (p.sk.t - 1), ang: 0, tickT: 0, owner: p });
       if (p.isLocal) this.announce("ОГНЕННЫЙ ДРАКОН!", "летит испепелять врагов");
+      this.spawnWave(p.x, p.y, 170, "#ff8a3c", 0, 18, 0.4);
+      this.spawnParticles(p.x, p.y, 28, "#ff9a3c", 320);
       this.addLight(p.x, p.y, 400, 0.6);
       this.audio.sfx("explosion");
     }

@@ -11,6 +11,8 @@ declare global {
   interface Window {
     __gameProbe?: () => { x: number; y: number; z: number };
     __GAME_READY__?: boolean;
+    __wantCapture?: number;
+    __captured?: string[];
   }
 }
 

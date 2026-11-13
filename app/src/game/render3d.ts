@@ -413,6 +413,43 @@ export class Renderer3D {
     return t;
   }
 
+  /** Спиральная текстура расенгана: закрученные голубые рукава. */
+  private swirlTex: THREE.CanvasTexture | null = null;
+  private swirlTexture(): THREE.CanvasTexture {
+    if (this.swirlTex) return this.swirlTex;
+    const c = document.createElement("canvas");
+    c.width = c.height = 256;
+    const ctx = c.getContext("2d")!;
+    ctx.translate(128, 128);
+    // светящееся ядро
+    const core = ctx.createRadialGradient(0, 0, 2, 0, 0, 60);
+    core.addColorStop(0, "rgba(255,255,255,1)");
+    core.addColorStop(0.5, "rgba(160,220,255,0.6)");
+    core.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = core;
+    ctx.fillRect(-128, -128, 256, 256);
+    // четыре закрученных рукава
+    for (let arm = 0; arm < 4; arm++) {
+      const a0 = (arm * Math.PI) / 2;
+      ctx.strokeStyle = arm % 2 ? "rgba(190,230,255,0.85)" : "rgba(110,180,255,0.7)";
+      ctx.lineWidth = 13;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      for (let i = 0; i <= 40; i++) {
+        const t = i / 40;
+        const ang = a0 + t * 3.6;
+        const r = 12 + t * 100;
+        const x = Math.cos(ang) * r, y = Math.sin(ang) * r;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    const t2 = new THREE.CanvasTexture(c);
+    t2.colorSpace = THREE.SRGBColorSpace;
+    this.swirlTex = t2;
+    return t2;
+  }
+
   private acquireFlame(): THREE.Mesh {
     if (this.flameCursor < this.flames.length) {
       const m = this.flames[this.flameCursor++];
@@ -738,6 +775,9 @@ export class Renderer3D {
       if (p.rageT > 0 && p.alive) {
         this.glowSprite("#ff3c1e", p.x, p.y, 95, 0.9, 0.5 + Math.sin(v.time * 10) * 0.15);
         this.ring(p.x, p.y, 60 + Math.sin(v.time * 8) * 6, 0xff5030, 0.5);
+        // кружащиеся языки пламени ярости
+        this.flameFan(p.x, p.y, v.time * 2.4, 0.75, 78 + Math.sin(v.time * 9) * 14, "fire", 0.32, 0.12);
+        this.flameFan(p.x, p.y, -v.time * 1.9 + 2.1, 0.75, 64, "fire", 0.26, 0.18);
       }
       const scalePulse = (p.swingT > 0 ? 1 + p.swingT * 0.35 : 1) * (p.rageT > 0 ? 1.35 : 1);
       void flip;
@@ -758,7 +798,14 @@ export class Renderer3D {
         seatY = mr.seatY * 0.8;
         this.ring(p.x, p.y + 18, 50, 0xffc85a, 0.3, 0.08);
       }
-      rig.group.position.set(p.x / S, seatY, p.y / S);
+      // сейсмический прыжок Даши: подъём по дуге с наклоном вперёд
+      let leapLift = 0, leapLean = 0;
+      if (p.leapT > 0) {
+        const lt = 1 - Math.max(0, p.leapT / 0.38);
+        leapLift = Math.sin(lt * Math.PI) * 2.2;
+        leapLean = 0.35;
+      }
+      rig.group.position.set(p.x / S, seatY + leapLift, p.y / S);
       // дуговой взмах ближнего боя (Никита)
       if (heroId === "nikita" && p.swingT > 0 && p.alive) {
         const at = 1 - Math.min(1, p.swingT / 0.2);
@@ -777,7 +824,7 @@ export class Renderer3D {
       const speed01 = Math.min(1, Math.hypot(p.vx, p.vy) / 280);
       rig.update({
         walk, moving: p.moving && !mounted, attackT, castT: 0,
-        dead01: p.alive ? 0 : 1, mounted, time: v.time, speed01, lean, roll,
+        dead01: p.alive ? 0 : 1, mounted, time: v.time, speed01, lean: lean + leapLean, roll,
       });
       rig.setOpacity(alpha);
       rig.setTint(p.hurtFlash > 0 ? 0xff9090 : 0xffffff);
@@ -822,22 +869,50 @@ export class Renderer3D {
       rig.setTint(0x9fd8ff);
     }
 
-    // огненные драконы
+    // огненный дракон Вики: змеевидное тело, раскалённая голова, крылья из пламени
     for (const dr of v.dragons) {
-      const flap = Math.sin(v.time * 14);
-      this.glowSprite("#ff7828", dr.x, dr.y, 90, 1.1, 0.85);
-      this.glowSprite("#ffe08a", dr.x + Math.cos(dr.ang) * 30, dr.y + Math.sin(dr.ang) * 30, 26, 1.15, 0.9);
-      // шлейф пламени
-      for (let k = 1; k <= 4; k++) {
-        const bx = dr.x - Math.cos(dr.ang) * k * 26;
-        const bz = dr.y - Math.sin(dr.ang) * k * 26;
-        this.glowSprite("#ff8a3c", bx + Math.sin(v.time * 14 + k) * 6 * flap * 0.2, bz, 30 - k * 5, 1.0, 0.5 - k * 0.1);
+      // тело: светящиеся сегменты, извивающиеся за головой
+      for (let k = 7; k >= 1; k--) {
+        const wob = Math.sin(v.time * 6 - k * 0.9) * 13;
+        const px = dr.x - Math.cos(dr.ang) * k * 24 + Math.cos(dr.ang + Math.PI / 2) * wob;
+        const pz = dr.y - Math.sin(dr.ang) * k * 24 + Math.sin(dr.ang + Math.PI / 2) * wob;
+        const kk = 1 - k / 9;
+        this.glowSprite(k % 2 ? "#ff8a3c" : "#ffb02e", px, pz, 30 * kk + 10, 0.95, 0.5 * kk + 0.2);
       }
+      // голова: жёлтое ядро + оранжевый ореол
+      this.glowSprite("#ff7828", dr.x, dr.y, 80, 1.15, 0.85);
+      this.glowSprite("#fff2c8", dr.x, dr.y, 30, 1.2, 0.95);
+      // рога/жало вперёд
+      this.glowSprite("#ffd24a", dr.x + Math.cos(dr.ang) * 26, dr.y + Math.sin(dr.ang) * 26, 16, 1.25, 0.8);
+      // крылья: мерцающие языки пламени по бокам
+      const flap = Math.sin(v.time * 12);
+      this.flameFan(dr.x, dr.y, dr.ang + Math.PI / 2, 0.55, 95 + flap * 22, "fire", 0.4 + flap * 0.12, 0.9);
+      this.flameFan(dr.x, dr.y, dr.ang - Math.PI / 2, 0.55, 95 - flap * 22, "fire", 0.4 - flap * 0.12, 0.9);
     }
 
     // снаряды
     if (!v.skip("projs"))
       for (const pr of v.projs) {
+        if (pr.kind === "rasenshuriken") {
+          // Большой расенган: закрученная сфера с рукавами и мощным ореолом
+          const spr = this.acquireSprite();
+          const sm = spr.material as THREE.SpriteMaterial;
+          if (sm.blending !== THREE.AdditiveBlending) { sm.blending = THREE.AdditiveBlending; sm.needsUpdate = true; }
+          sm.map = this.swirlTexture();
+          sm.opacity = 0.95;
+          sm.color.setHex(0xffffff);
+          sm.rotation = -v.time * 14;
+          const sz = (pr.r * 3.4) / S;
+          spr.scale.set(sz, sz, 1);
+          spr.position.set(pr.x / S, 0.8, pr.y / S);
+          this.glowSprite("#7ec8ff", pr.x, pr.y, pr.r * 2.6, 0.8, 0.75);
+          this.glowSprite("#ffffff", pr.x, pr.y, pr.r * 1.0, 0.82, 0.85);
+          // голубой энергетический шлейф
+          const spd2 = Math.hypot(pr.vx, pr.vy) || 1;
+          const bx = pr.x - (pr.vx / spd2) * pr.r * 6, by = pr.y - (pr.vy / spd2) * pr.r * 6;
+          this.fan(bx, by, Math.atan2(pr.vy, pr.vx), 0.12, pr.r * 6, 0x5aa8ff, 0.4);
+          continue;
+        }
         this.glowSprite(pr.color, pr.x, pr.y, pr.r * 2.4, 0.75, 0.95);
         // белое раскалённое ядро
         this.glowSprite("#ffffff", pr.x, pr.y, pr.r * 1.05, 0.75, 0.9);
@@ -928,5 +1003,10 @@ export class Renderer3D {
     this.endPools();
     if (this.composer) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
+    // дебаг-захват кадров для верификации эффектов (только по флагу из тестов)
+    if (window.__wantCapture && window.__wantCapture > 0) {
+      window.__wantCapture--;
+      (window.__captured ||= []).push(this.renderer.domElement.toDataURL("image/png"));
+    }
   }
 }

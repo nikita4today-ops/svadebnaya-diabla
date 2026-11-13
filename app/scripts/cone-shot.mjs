@@ -38,9 +38,16 @@ await page.waitForTimeout(1500);
 await page.mouse.move(900, 300);
 await page.waitForTimeout(200);
 // серия попыток поймать конус: жмём скилл и сразу делаем кадры подряд
-await page.evaluate(() => { window.__debug.heal(); window.__debug.cone(); });
+await page.evaluate(() => { window.__debug.heal(); });
+// уровень растёт на 1 за кадр — качаем с паузами до 8 уровня
+for (let i = 0; i < 8; i++) { await page.evaluate(() => window.__debug.lvl()); await page.waitForTimeout(250); }
+await page.keyboard.press("Digit4"); // вложить очко в ульт
 await page.waitForTimeout(400);
-await page.screenshot({ path: join(SHOTS, `cone-debug-h${hero}.png`) });
+await page.keyboard.press(skill);
+await page.waitForTimeout(350);
+await page.screenshot({ path: join(SHOTS, `ult-h${hero}.png`) });
+await page.waitForTimeout(1200);
+await page.screenshot({ path: join(SHOTS, `ult2-h${hero}.png`) });
 console.log("cone shots ok, errors:", errs.length ? errs : "none");
 await browser.close();
 server.close();
