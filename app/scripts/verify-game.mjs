@@ -76,8 +76,8 @@ let browser;
 for (const exe of [null, ...CANDIDATES]) {
   try {
     browser = await chromium.launch(exe
-      ? { executablePath: exe, args: ["--no-sandbox", "--disable-gpu-sandbox", "--use-gl=swiftshader"] }
-      : {});
+      ? { executablePath: exe, args: ["--no-sandbox", "--disable-gpu-sandbox", "--enable-unsafe-swiftshader"] }
+      : { args: ["--enable-unsafe-swiftshader"] });
     break;
   } catch { /* try the next one */ }
 }

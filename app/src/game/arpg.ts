@@ -14,6 +14,8 @@ import {
 } from "./heroes";
 import type { HeroDef, EnemyKindDef, MapDef, LootKind } from "./heroes";
 import { paintMap } from "./maps";
+import { Renderer3D } from "./render3d";
+import type { View3D } from "./render3d";
 import { Net, makeRoomCode } from "./net";
 import type { SnapMsg, EvMsg, LobbyPlayer } from "./net";
 
@@ -164,6 +166,9 @@ function saveBest(b: BestMap): void {
 
 export class Arpg {
   private ctx: CanvasRenderingContext2D;
+  /** WebGL-рендер мира (изометрия Diablo 3); null — запасной 2D-рендер. */
+  private r3d: Renderer3D | null = null;
+  private glCanvas: HTMLCanvasElement | null = null;
   private loop: GameLoop;
   private input: Input;
   private audio = new AudioSystem();
@@ -304,6 +309,19 @@ export class Arpg {
     this.ctx = canvas.getContext("2d")!;
     this.input = new Input(canvas);
     this.resize();
+    // 3D-рендер: изометрическая камера в духе Diablo 3 (запасной путь — 2D)
+    try {
+      const glc = document.createElement("canvas");
+      glc.style.cssText = "position:fixed;inset:0;z-index:0;pointer-events:none;";
+      this.canvas.style.position = "fixed";
+      this.canvas.style.zIndex = "1";
+      this.canvas.style.background = "transparent";
+      this.canvas.parentElement?.insertBefore(glc, this.canvas);
+      this.r3d = new Renderer3D(glc);
+      this.glCanvas = glc;
+    } catch {
+      this.r3d = null;
+    }
     const on = <T extends Event>(el: HTMLElement | Window, type: string, fn: (e: T) => void) => {
       const h = fn as EventListener;
       el.addEventListener(type, h);
@@ -411,6 +429,8 @@ export class Arpg {
   start(): void { this.loop.start(); }
 
   dispose(): void {
+    this.r3d?.dispose();
+    this.glCanvas?.remove();
     this.loop.stop();
     this.input.dispose();
     this.audio.dispose();
@@ -2494,11 +2514,22 @@ export class Arpg {
   private render(): void {
     const ctx = this.ctx;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    if (this.state === "select") { this.renderSelect(ctx); return; }
-    if (this.state === "lobby") { this.renderLobby(ctx); return; }
+    if (this.state === "select") { if (this.glCanvas) this.glCanvas.style.display = "none"; this.renderSelect(ctx); return; }
+    if (this.state === "lobby") { if (this.glCanvas) this.glCanvas.style.display = "none"; this.renderLobby(ctx); return; }
     const camX = this.camX() + (Math.random() - 0.5) * this.shake;
     const camY = this.camY() + (Math.random() - 0.5) * this.shake;
     let tSec = performance.now();
+
+    // 3D-путь: мир рисует WebGL, поверх — 2D-оверлей и HUD
+    if (this.r3d) {
+      if (this.glCanvas) this.glCanvas.style.display = "";
+      ctx.clearRect(0, 0, this.w, this.h);
+      this.r3d.render(this.view3d(), this.w, this.h);
+      this.drawOverlay3d(ctx);
+      if (!this.skipSec.has("hud")) this.renderHud(ctx);
+      this.perfSec[4] += performance.now() - tSec;
+      return;
+    }
 
     // карта всегда перекрывает весь экран (камера зажата в мир) — полный fillRect нужен только при тряске
     if (this.shake > 0.3 || this.w > WORLD_SIZE || this.h > WORLD_SIZE) {
@@ -2769,6 +2800,117 @@ export class Arpg {
   }
 
   /** Диабловское освещение: тьма вокруг, круги света у героя, кота, снарядов и сфер. */
+  /** Снимок мира для 3D-рендера (ссылки на живые массивы — без копий). */
+  private view3d(): View3D {
+    return {
+      time: this.time,
+      mapCanvas: this.mapCanvas,
+      mapId: this.map.id,
+      target: { x: this.camTarget().x, y: this.camTarget().y },
+      shake: this.shake,
+      players: this.players,
+      enemies: this.enemies,
+      corpses: this.corpses,
+      projs: this.projs,
+      volleys: this.volleys,
+      particles: this.particles,
+      waves: this.waves,
+      cones: this.cones,
+      telegraphs: this.telegraphs,
+      decals: this.decals,
+      orbs: this.orbs,
+      golds: this.golds,
+      loots: this.loots,
+      satorus: this.satorus,
+      clones: this.clones,
+      dragons: this.dragons,
+      tempLights: this.tempLights,
+      meHeroId: this.hero.id,
+      bake: (id, cat) => this.bakePuppet(id, cat),
+      lootColor: (kind) => LOOT[kind as LootKind].color,
+      skip: (sec) => this.skipSec.has(sec),
+    };
+  }
+
+  /** 2D-оверлей поверх 3D: полоски HP, имена, флотеры — через проекцию мировых координат. */
+  private drawOverlay3d(ctx: CanvasRenderingContext2D): void {
+    const r3 = this.r3d!;
+    ctx.textAlign = "center";
+    // враги: полоски HP и статусы
+    for (const e of this.enemies) {
+      const scale = (e.boss ? 2.1 : 1) * (e.kind.scaleMul ?? 1);
+      const hh = e.radius * 3.6 * scale;
+      const top = r3.project(e.x, hh + 16, e.y, this.w, this.h);
+      if (!top.vis) continue;
+      if (e.hp < e.maxHp) {
+        const wpx = e.radius * 2.2 * scale;
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(top.x - wpx / 2, top.y - 3, wpx, 5);
+        ctx.fillStyle = e.boss ? "#e84a4a" : "#5ee87a";
+        ctx.fillRect(top.x - wpx / 2, top.y - 3, wpx * Math.max(0, e.hp / e.maxHp), 5);
+      }
+      if (e.disarmT > 0) { ctx.fillStyle = "#ff5252"; ctx.font = "bold 13px Georgia"; ctx.fillText("ОБЕЗОРУЖЕН", top.x, top.y - 8); }
+      if (e.charmT > 0) { ctx.fillStyle = "#3ddc84"; ctx.font = "bold 11px Georgia"; ctx.fillText("ПОДЧИНЁН", top.x, top.y - 8); }
+    }
+    // удалённые игроки: имя, HP, воскрешение
+    for (const p of this.players) {
+      if (p.isLocal) continue;
+      const sp = r3.project(p.x, 94, p.y, this.w, this.h);
+      if (!sp.vis) continue;
+      ctx.fillStyle = p.alive ? "#ffe9b0" : "#8a8078";
+      ctx.font = "bold 13px Georgia";
+      ctx.fillText(p.hero.name, sp.x, sp.y);
+      if (p.alive && p.hp < p.maxHp) {
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(sp.x - 26, sp.y + 5, 52, 5);
+        ctx.fillStyle = "#5ee87a";
+        ctx.fillRect(sp.x - 26, sp.y + 5, 52 * Math.max(0, p.hp / p.maxHp), 5);
+      }
+      if (!p.alive) {
+        ctx.fillStyle = "#c8352a";
+        ctx.font = "bold 12px Georgia";
+        ctx.fillText("ПАЛ", sp.x, sp.y - 14);
+        if (this.netMode !== "off") {
+          if (p.reviveProg > 0) {
+            ctx.strokeStyle = "#7ee87a";
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y + 30, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p.reviveProg);
+            ctx.stroke();
+            ctx.fillStyle = "#7ee87a";
+            ctx.font = "11px Georgia";
+            ctx.fillText("воскрешение…", sp.x, sp.y + 62);
+          } else {
+            ctx.fillStyle = "rgba(126,232,122,0.55)";
+            ctx.font = "11px Georgia";
+            ctx.fillText("встань рядом — воскресишь", sp.x, sp.y + 62);
+          }
+        }
+      }
+    }
+    // локальный павший герой
+    if (!this.me.alive) {
+      const sp = r3.project(this.px, 92, this.py, this.w, this.h);
+      if (sp.vis) {
+        ctx.fillStyle = "#c8352a";
+        ctx.font = "bold 14px Georgia";
+        ctx.fillText("ВЫ ПАЛИ", sp.x, sp.y);
+      }
+    }
+    // флотеры
+    if (!this.skipSec.has("floaters")) {
+      ctx.font = "bold 15px Arial";
+      for (const f of this.floaters) {
+        const sp = r3.project(f.x, 70, f.y, this.w, this.h);
+        if (!sp.vis) continue;
+        ctx.globalAlpha = Math.min(1, f.life / 0.4);
+        ctx.fillStyle = f.color;
+        ctx.fillText(f.text, sp.x, sp.y);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
   private renderLighting(ctx: CanvasRenderingContext2D, camX: number, camY: number): void {
     const lc = this.lightCtx;
     if (!lc || !this.lightCanvas) return;
