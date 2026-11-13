@@ -1061,7 +1061,9 @@ export class Arpg {
       this.py += this.pvy * dt;
       moving = want || Math.hypot(this.pvx, this.pvy) > 14;
     }
-    if (moving) this.walkPhase += dt * (this.dashT > 0 ? 2.2 : 1);
+    // темп шага привязан к реальной скорости: на разгоне шаг медленный, ноги не скользят
+    const spdK = Math.min(1.3, Math.hypot(this.pvx, this.pvy) / Math.max(1, sp));
+    if (moving) this.walkPhase += dt * (this.dashT > 0 ? 2.2 : 0.35 + 0.75 * spdK);
     this.me.moving = moving;
     this.px = Math.max(40, Math.min(WORLD_SIZE - 40, this.px));
     this.py = Math.max(40, Math.min(WORLD_SIZE - 40, this.py));

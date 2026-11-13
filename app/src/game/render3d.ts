@@ -80,6 +80,11 @@ export class Renderer3D {
   private rigSeen = new Set<object>();
   private catSeen = new Set<object>();
 
+  // сглаживание поворотов и оценка ускорения для наклонов
+  private yawPrev = new Map<object, number>();
+  private velPrev = new Map<object, { x: number; y: number }>();
+  private lastTime = 0;
+
   private camPos = new THREE.Vector3();
   private lastW = 0; private lastH = 0;
 
@@ -283,13 +288,29 @@ export class Renderer3D {
   /** Удаляет риги объектов, которых не было в этом кадре. */
   private endRigs(): void {
     for (const [k, r] of this.rigs) {
-      if (!this.rigSeen.has(k)) { this.scene.remove(r.group); this.rigs.delete(k); }
+      if (!this.rigSeen.has(k)) {
+        this.scene.remove(r.group); this.rigs.delete(k);
+        this.yawPrev.delete(k); this.velPrev.delete(k);
+      }
     }
     for (const [k, r] of this.catRigs) {
-      if (!this.catSeen.has(k)) { this.scene.remove(r.group); this.catRigs.delete(k); }
+      if (!this.catSeen.has(k)) { this.scene.remove(r.group); this.catRigs.delete(k); this.yawPrev.delete(k); }
     }
     this.rigSeen.clear();
     this.catSeen.clear();
+  }
+
+  /** Плавный доворот к целевому углу по кратчайшей дуге (ограниченная угл. скорость). */
+  private yawOf(key: object, target: number, dt: number): number {
+    const cur = this.yawPrev.get(key);
+    if (cur === undefined) { this.yawPrev.set(key, target); return target; }
+    let d = target - cur;
+    while (d > Math.PI) d -= TWO_PI;
+    while (d < -Math.PI) d += TWO_PI;
+    const maxStep = 11 * dt;
+    const next = cur + Math.max(-maxStep, Math.min(maxStep, d));
+    this.yawPrev.set(key, next);
+    return next;
   }
 
   private endPools(): void {
@@ -381,6 +402,8 @@ export class Renderer3D {
 
   render(v: View3D, w: number, h: number): void {
     this.setSize(w, h);
+    const dt = this.lastTime > 0 ? Math.max(1 / 240, Math.min(0.1, v.time - this.lastTime)) : 1 / 60;
+    this.lastTime = v.time;
 
     // камера следует за героем (изометрия Diablo 3)
     const cx = v.target.x / S, cz = v.target.y / S;
@@ -467,8 +490,8 @@ export class Renderer3D {
       rig.group.position.set((e.x + lx) / S, 0, (e.y + lz) / S);
       // рост модели пропорционален радиусу существа (база рига ~60px)
       rig.group.scale.setScalar(scale * Math.max(0.55, (r * 3.6) / 60));
-      rig.group.rotation.y = Math.atan2(v.target.x - e.x, v.target.y - e.y);
-      rig.update({ walk: e.anim * 7, moving: true, attackT, castT: 0, dead01: 0, mounted: false, time: v.time });
+      rig.group.rotation.y = this.yawOf(e, Math.atan2(v.target.x - e.x, v.target.y - e.y), dt);
+      rig.update({ walk: e.anim * 7, moving: true, attackT, castT: 0, dead01: 0, mounted: false, time: v.time, speed01: 1 });
       rig.setOpacity(1);
       rig.setTint(tint);
       if (e.flash > 0) this.glowSprite("#ffffff", e.x + lx, e.y + lz, hh * 0.75, 0.8, 0.6 * Math.min(1, e.flash / 0.12));
@@ -499,12 +522,23 @@ export class Renderer3D {
       const rig = this.humanRigFor(p, heroOpts(heroId));
       rig.group.position.set(p.x / S, mounted ? 0.55 : 0, p.y / S);
       rig.group.scale.setScalar(1.25 * scalePulse);
-      // поворот: по скорости при движении, иначе куда смотрит (к курсору)
+      // поворот: по скорости при движении, иначе куда смотрит (к курсору) — с плавным доворотом
       const dirA = p.moving && (p.vx !== 0 || p.vy !== 0) ? Math.atan2(p.vy, p.vx) : p.facing;
-      rig.group.rotation.y = Math.atan2(Math.cos(dirA), Math.sin(dirA));
+      rig.group.rotation.y = this.yawOf(p, Math.atan2(Math.cos(dirA), Math.sin(dirA)), dt);
+      // инерция: ускорение вперёд/назад → продольный наклон, боковое → крен в повороте
+      const pv = this.velPrev.get(p);
+      let ax = 0, ay = 0;
+      if (pv) { ax = (p.vx - pv.x) / dt; ay = (p.vy - pv.y) / dt; }
+      this.velPrev.set(p, { x: p.vx, y: p.vy });
+      const fx = Math.cos(dirA), fy = Math.sin(dirA);
+      const fwd = ax * fx + ay * fy;
+      const side = -ax * fy + ay * fx;
+      const lean = Math.max(-0.28, Math.min(0.28, fwd * 0.00009));
+      const roll = Math.max(-0.24, Math.min(0.24, -side * 0.00007));
+      const speed01 = Math.min(1, Math.hypot(p.vx, p.vy) / 280);
       rig.update({
         walk, moving: p.moving && !mounted, attackT, castT: 0,
-        dead01: p.alive ? 0 : 1, mounted, time: v.time,
+        dead01: p.alive ? 0 : 1, mounted, time: v.time, speed01, lean, roll,
       });
       rig.setOpacity(alpha);
       rig.setTint(p.hurtFlash > 0 ? 0xff9090 : 0xffffff);
@@ -527,7 +561,7 @@ export class Renderer3D {
         const d = (e.x - s2.x) * (e.x - s2.x) + (e.y - s2.y) * (e.y - s2.y);
         if (d < bd) { bd = d; best = e; }
       }
-      if (best) rig.group.rotation.y = Math.atan2(best.x - s2.x, best.y - s2.y);
+      if (best) rig.group.rotation.y = this.yawOf(s2, Math.atan2(best.x - s2.x, best.y - s2.y), dt);
       rig.update({ walk: v.time * 16, moving: true, attackT: atkT, castT: 0, dead01: 0, mounted: false, time: v.time });
       rig.setOpacity(1);
     }
@@ -543,8 +577,8 @@ export class Renderer3D {
         const d = (e.x - c.x) * (e.x - c.x) + (e.y - c.y) * (e.y - c.y);
         if (d < bd) { bd = d; best = e; }
       }
-      if (best) rig.group.rotation.y = Math.atan2(best.x - c.x, best.y - c.y);
-      rig.update({ walk: c.walk * 11, moving: true, attackT: 0, castT: 0, dead01: 0, mounted: false, time: v.time });
+      if (best) rig.group.rotation.y = this.yawOf(c, Math.atan2(best.x - c.x, best.y - c.y), dt);
+      rig.update({ walk: c.walk * 11, moving: true, attackT: 0, castT: 0, dead01: 0, mounted: false, time: v.time, speed01: 1 });
       rig.setOpacity(0.65);
       rig.setTint(0x9fd8ff);
     }

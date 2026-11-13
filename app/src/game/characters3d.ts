@@ -34,6 +34,9 @@ export interface RigState {
   dead01: number;  // 0 — жив, 1 — лежит
   mounted: boolean;
   time: number;
+  speed01?: number; // доля от макс. скорости — амплитуда шага и наклон бега
+  lean?: number;    // продольный наклон (разгон вперёд / торможение назад), рад
+  roll?: number;    // боковой наклон в повороте, рад
 }
 
 const geoCache = new Map<string, THREE.BufferGeometry>();
@@ -201,6 +204,8 @@ export class HumanRig {
     const sw = Math.sin(st.walk);
     const sw2 = Math.sin(st.walk + Math.PI);
     const movingK = st.moving ? 1 : 0;
+    // амплитуда шага растёт со скоростью — ноги не «семенят» на разгоне
+    const amp = 0.55 + 0.45 * Math.min(1, st.speed01 ?? 1);
 
     // смерть: падение навзничь
     if (st.dead01 > 0) {
@@ -212,6 +217,8 @@ export class HumanRig {
 
     // посадка на маунте: ноги согнуты вперёд, корпус ровно
     if (st.mounted) {
+      this.hips.rotation.x = 0;
+      this.hips.rotation.z = 0;
       this.hips.position.y = this.baseHipY - 0.18;
       this.hipL.rotation.x = -1.35; this.hipR.rotation.x = -1.35;
       this.kneeL.rotation.x = 1.35; this.kneeR.rotation.x = 1.35;
@@ -222,12 +229,14 @@ export class HumanRig {
 
     // походка: бёдра в противофазе, колени сгибаются на переносе,
     // корпус покачивается и чуть наклонён вперёд — шаг «с весом»
-    this.hipL.rotation.x = sw * 0.62 * movingK;
-    this.hipR.rotation.x = sw2 * 0.62 * movingK;
-    this.kneeL.rotation.x = Math.max(0, -sw) * 0.9 * movingK;
-    this.kneeR.rotation.x = Math.max(0, -sw2) * 0.9 * movingK;
-    this.hips.position.y = this.baseHipY + Math.abs(Math.cos(st.walk)) * 0.055 * movingK;
-    this.hips.rotation.z = sw * 0.05 * movingK;
+    this.hipL.rotation.x = sw * 0.62 * amp * movingK;
+    this.hipR.rotation.x = sw2 * 0.62 * amp * movingK;
+    this.kneeL.rotation.x = Math.max(0, -sw) * 0.9 * amp * movingK;
+    this.kneeR.rotation.x = Math.max(0, -sw2) * 0.9 * amp * movingK;
+    this.hips.position.y = this.baseHipY + Math.abs(Math.cos(st.walk)) * 0.055 * amp * movingK;
+    // наклон бега вперёд + инерционные lean/roll от рендера
+    this.hips.rotation.x = 0.1 * movingK * Math.min(1, st.speed01 ?? 1) + (st.lean ?? 0);
+    this.hips.rotation.z = sw * 0.05 * movingK + (st.roll ?? 0);
     this.torsoG.rotation.x = 0.1 * movingK + Math.sin(st.time * 1.8) * 0.015;
     this.torsoG.rotation.y = sw * 0.08 * movingK;
     this.headG.rotation.y = -sw * 0.06 * movingK;
