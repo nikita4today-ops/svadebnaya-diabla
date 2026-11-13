@@ -32,6 +32,7 @@ export function startGame(canvas: HTMLCanvasElement): void {
     gold: () => game.debugGold(),
     wave: () => game.debugWave(),
     lvl: () => game.debugLvl(),
+    cone: () => game.debugCone(),
   };
   (window as unknown as { __dbg2?: () => unknown }).__dbg2 = () => game.debugInfo2();
   (window as unknown as { __dbgAim?: () => unknown }).__dbgAim = () => game.debugAim();

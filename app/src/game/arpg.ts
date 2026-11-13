@@ -302,6 +302,8 @@ export class Arpg {
   // мышь
   private mx = 0; private my = 0; private mouseDown = false;
   private aimX = 0; private aimY = 0; // мировая точка под курсором
+  private vignette3d: HTMLCanvasElement | null = null;
+  private vignette3dKey = "";
   private cardRects: Array<{ x: number; y: number; w: number; h: number }> = [];
   private menuBtns: Array<{ x: number; y: number; w: number; h: number; act: string }> = [];
   private unsub: Array<() => void> = [];
@@ -2526,6 +2528,11 @@ export class Arpg {
   debugInfo2(): Record<string, unknown> {
     return { ws: this.waveState, bt: +this.breakT.toFixed(1), gold: this.me.gold, pts: this.me.skillPts, sk: this.me.sk, buys: this.me.buys, shop: this.shopOpen, tg: this.telegraphs.length, kills: this.me.kills, paused: this.netPaused, met: this.meteorAnnounced };
   }
+  /** Отладка конусов: два долгоживущих веера — огонь и иней. */
+  debugCone(): void {
+    this.cones.push({ x: this.px, y: this.py, dir: this.facing, half: 0.62, range: 270, life: 4, maxLife: 4, color: "#ff7a3c" });
+    this.cones.push({ x: this.px - 140, y: this.py - 120, dir: 0.8, half: 0.62, range: 200, life: 4, maxLife: 4, color: "#cfeaff" });
+  }
   /** Отладка прицела: мировая точка под курсором и её обратная проекция на экран. */
   debugAim(): Record<string, unknown> {
     const scr = this.r3d ? this.r3d.project(this.aimX, 0, this.aimY, this.w, this.h) : null;
@@ -2866,6 +2873,21 @@ export class Arpg {
   /** 2D-оверлей поверх 3D: полоски HP, имена, флотеры — через проекцию мировых координат. */
   private drawOverlay3d(ctx: CanvasRenderingContext2D): void {
     const r3 = this.r3d!;
+    // виньетка: затемнённые края кадра (атмосфера Diablo 3)
+    const vkey = `${this.w}x${this.h}`;
+    if (this.vignette3dKey !== vkey) {
+      this.vignette3dKey = vkey;
+      const vc = document.createElement("canvas");
+      vc.width = this.w; vc.height = this.h;
+      const vx = vc.getContext("2d")!;
+      const g = vx.createRadialGradient(this.w / 2, this.h / 2, Math.min(this.w, this.h) * 0.42, this.w / 2, this.h / 2, Math.max(this.w, this.h) * 0.72);
+      g.addColorStop(0, "rgba(0,0,0,0)");
+      g.addColorStop(1, "rgba(3,5,10,0.4)");
+      vx.fillStyle = g;
+      vx.fillRect(0, 0, this.w, this.h);
+      this.vignette3d = vc;
+    }
+    if (this.vignette3d) ctx.drawImage(this.vignette3d, 0, 0);
     ctx.textAlign = "center";
     // враги: полоски HP и статусы
     for (const e of this.enemies) {

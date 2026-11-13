@@ -42,8 +42,9 @@ await page.screenshot({ path: join(SHOTS, `fix-face-h${hero}.png`) });
 // активируем маунта/скилл
 await page.evaluate(() => window.__debug.heal());
 await page.keyboard.press(skill);
-await page.waitForTimeout(1200);
+await page.waitForTimeout(140);
 await page.screenshot({ path: join(SHOTS, `fix-mount-h${hero}.png`) });
+await page.waitForTimeout(1000);
 console.log("fix shots ok, errors:", errs.length ? errs : "none");
 await browser.close();
 server.close();

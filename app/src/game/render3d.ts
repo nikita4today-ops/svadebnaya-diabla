@@ -92,6 +92,9 @@ export class Renderer3D {
   private mountSeen = new Set<object>();
   private slashes: THREE.Mesh[] = [];
   private slashCursor = 0;
+  private flames: THREE.Mesh[] = [];
+  private flameCursor = 0;
+  private flameTexCache: { fire?: THREE.CanvasTexture; frost?: THREE.CanvasTexture } = {};
 
   // сглаживание поворотов и оценка ускорения для наклонов
   private yawPrev = new Map<object, number>();
@@ -366,6 +369,94 @@ export class Renderer3D {
     return m;
   }
 
+  /** Текстура пламени/инея: раскалённое ядро у основания, прозрачный край с прожилками. */
+  private flameTexture(kind: "fire" | "frost"): THREE.CanvasTexture {
+    const cached = this.flameTexCache[kind];
+    if (cached) return cached;
+    const c = document.createElement("canvas");
+    c.width = 128; c.height = 256;
+    const ctx = c.getContext("2d")!;
+    const g = ctx.createLinearGradient(0, 256, 0, 0);
+    if (kind === "fire") {
+      g.addColorStop(0, "rgba(255,252,240,1)");
+      g.addColorStop(0.18, "rgba(255,210,74,0.95)");
+      g.addColorStop(0.5, "rgba(255,122,40,0.6)");
+      g.addColorStop(0.85, "rgba(200,50,16,0.15)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+    } else {
+      g.addColorStop(0, "rgba(245,252,255,1)");
+      g.addColorStop(0.2, "rgba(180,230,255,0.9)");
+      g.addColorStop(0.55, "rgba(110,170,255,0.5)");
+      g.addColorStop(0.85, "rgba(70,110,220,0.12)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+    }
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 128, 256);
+    // вертикальные прожилки — «языки»
+    ctx.globalCompositeOperation = "destination-out";
+    let seed = kind === "fire" ? 31 : 77;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < 26; i++) {
+      const x = rnd() * 128;
+      const w = 2 + rnd() * 6;
+      const y0 = 60 + rnd() * 120;
+      const grd = ctx.createLinearGradient(0, y0, 0, 256);
+      grd.addColorStop(0, `rgba(0,0,0,${0.25 + rnd() * 0.4})`);
+      grd.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = grd;
+      ctx.fillRect(x, y0, w, 256 - y0);
+    }
+    ctx.globalCompositeOperation = "source-over";
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    this.flameTexCache[kind] = t;
+    return t;
+  }
+
+  private acquireFlame(): THREE.Mesh {
+    if (this.flameCursor < this.flames.length) {
+      const m = this.flames[this.flameCursor++];
+      m.visible = true;
+      return m;
+    }
+    const m = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }),
+    );
+    m.rotation.x = -Math.PI / 2;
+    this.flames.push(m);
+    this.scene.add(m);
+    this.flameCursor++;
+    return m;
+  }
+
+  /** Объёмный язык пламени/инея: текстурный веер с UV вдоль радиуса. */
+  private flameFan(wx: number, wz: number, dir: number, half: number, rangePx: number, kind: "fire" | "frost", alpha: number, yU = 0.12): void {
+    const m = this.acquireFlame();
+    const segs = 20;
+    const verts: number[] = [0, 0, 0];
+    const uvs: number[] = [0.5, 0];
+    for (let i = 0; i <= segs; i++) {
+      const a = dir - half + (2 * half * i) / segs;
+      verts.push(Math.cos(a), Math.sin(a), 0);
+      uvs.push(i / segs, 1);
+    }
+    const idx: number[] = [];
+    for (let i = 1; i <= segs; i++) idx.push(0, i, i + 1);
+    const g = m.geometry as THREE.BufferGeometry;
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+    g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(uvs), 2));
+    g.setIndex(idx);
+    const mat = m.material as THREE.MeshBasicMaterial;
+    const tex = this.flameTexture(kind);
+    if (!mat.map) { mat.map = tex; mat.needsUpdate = true; }
+    else mat.map = tex;
+    mat.opacity = alpha;
+    mat.color.setHex(0xffffff);
+    m.scale.set(rangePx / S, rangePx / S, 1);
+    m.position.set(wx / S, yU, wz / S);
+  }
+
   /** Дуговой взмах оружия (кольцевой сектор, как в Diablo). */
   private slash(wx: number, wz: number, a0: number, arcLen: number, rPx: number, color: number, alpha: number, yU = 0.55): void {
     const m = this.acquireSlash();
@@ -429,7 +520,8 @@ export class Renderer3D {
     for (let i = this.ringCursor; i < this.rings.length; i++) this.rings[i].visible = false;
     for (let i = this.fanCursor; i < this.fans.length; i++) this.fans[i].visible = false;
     for (let i = this.slashCursor; i < this.slashes.length; i++) this.slashes[i].visible = false;
-    this.spriteCursor = 0; this.flatCursor = 0; this.ringCursor = 0; this.fanCursor = 0; this.slashCursor = 0;
+    for (let i = this.flameCursor; i < this.flames.length; i++) this.flames[i].visible = false;
+    this.spriteCursor = 0; this.flatCursor = 0; this.ringCursor = 0; this.fanCursor = 0; this.slashCursor = 0; this.flameCursor = 0;
   }
 
   /** Билборд персонажа из запечённых кадров куклы. */
@@ -557,6 +649,16 @@ export class Renderer3D {
       this.flatCircle(tg.x, tg.y, tg.r, tg.r, col, 0.22 + 0.1 * Math.sin(v.time * 10), 0.035);
       this.ring(tg.x, tg.y, tg.r, tg.kind === "meteor" ? 0xffb02e : 0xff5a3c, 0.85);
       this.ring(tg.x, tg.y, Math.max(4, tg.r * (1 - prog)), 0xffffff, 0.7);
+      // падающий огненный шар с дымно-огненным шлейфом (как метеор в D3)
+      if (tg.kind === "meteor" && prog > 0.15) {
+        const yF = (1 - prog) * 15 + 0.4;
+        const sizeK = 0.4 + prog * 0.8;
+        this.glowSprite("#ff6a2c", tg.x, tg.y, 55 * sizeK, yF, 0.85);
+        this.glowSprite("#ffd24a", tg.x, tg.y, 24 * sizeK, yF, 0.95);
+        for (let k = 1; k <= 3; k++) {
+          this.glowSprite("#ff8a3c", tg.x - 6 * k, tg.y - 6 * k, 18 * sizeK * (1 - k * 0.22), yF + k * 1.6, 0.5 - k * 0.12);
+        }
+      }
     }
 
     // сферы здоровья, золото, лут
@@ -765,11 +867,38 @@ export class Renderer3D {
       pos.needsUpdate = true; colA.needsUpdate = true;
     }
 
-    // конусные вспышки
+    // дрейфующий наземный туман (атмосфера Diablo 3)
+    if (!v.skip("mist")) {
+      for (let i = 0; i < 10; i++) {
+        const ang = i * 2.399963 + v.time * 0.015 * ((i % 3) - 1);
+        const rad = 320 + (i % 4) * 150;
+        const mx = v.target.x + Math.cos(ang) * rad + Math.sin(v.time * 0.11 + i * 1.7) * 70;
+        const mz = v.target.y + Math.sin(ang) * rad + Math.cos(v.time * 0.09 + i * 2.3) * 70;
+        const spr = this.acquireSprite();
+        const mm = spr.material as THREE.SpriteMaterial;
+        if (mm.blending !== THREE.NormalBlending) { mm.blending = THREE.NormalBlending; mm.needsUpdate = true; }
+        mm.map = this.glow("#9aa4b8");
+        mm.opacity = 0.055;
+        mm.color.setHex(0xffffff);
+        const sz = 11 + (i % 3) * 5;
+        spr.scale.set(sz, sz * 0.4, 1);
+        spr.position.set(mx / S, 0.45 + (i % 2) * 0.25, mz / S);
+      }
+    }
+
+    // конусные вспышки: трёхслойное объёмное пламя или иней (по цвету скила)
     for (const c of v.cones) {
       const a = Math.max(0, c.life / c.maxLife);
-      const col = new THREE.Color(c.color).getHex();
-      this.fan(c.x, c.y, c.dir, c.half, c.range * (1.15 - a * 0.15), col, a * 0.4);
+      const cc = new THREE.Color(c.color);
+      const kind = cc.b > cc.r ? "frost" : "fire";
+      const grow = 1.25 - a * 0.25;
+      this.flameFan(c.x, c.y, c.dir, c.half, c.range * grow, kind, a * 0.55, 0.1);
+      this.flameFan(c.x, c.y, c.dir, c.half * 0.75, c.range * 0.82 * grow, kind, a * 0.75, 0.16);
+      this.flameFan(c.x, c.y, c.dir, c.half * 0.5, c.range * 0.58, kind, a * 0.95, 0.22);
+      // жар/мороз в эпицентре
+      const hx = c.x + Math.cos(c.dir) * c.range * 0.45;
+      const hz = c.y + Math.sin(c.dir) * c.range * 0.45;
+      this.glowSprite(kind === "fire" ? "#ff9a3c" : "#bfe4ff", hx, hz, c.range * 0.45, 0.5, a * 0.55);
     }
 
     // ударные волны
@@ -778,6 +907,8 @@ export class Renderer3D {
       const col = new THREE.Color(wv.color).getHex();
       this.ring(wv.x, wv.y, wv.r, col, a * 0.55, 0.09);
       this.ring(wv.x, wv.y, Math.max(2, wv.r * 0.94), 0xffffff, a * 0.5, 0.1);
+      // вспышка в эпицентре ударной волны
+      this.glowSprite(wv.color, wv.x, wv.y, Math.max(20, wv.r * 0.5), 0.45, a * 0.45);
     }
 
     // точечные источники света (заклинания, взрывы)

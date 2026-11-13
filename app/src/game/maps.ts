@@ -306,5 +306,36 @@ export function paintMap(mapId: MapId): HTMLCanvasElement {
   ctx.strokeStyle = "rgba(0,0,0,0.6)";
   ctx.lineWidth = 16;
   ctx.strokeRect(0, 0, WORLD_SIZE, WORLD_SIZE);
+  grunge(ctx);
   return c;
+}
+
+/** Живописная фактура поверх разметки: мокрые разводы, крошка, затемнение к краям (дух Diablo 3). */
+function grunge(ctx: CanvasRenderingContext2D): void {
+  const W = WORLD_SIZE;
+  let s = 1234567;
+  const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  // крупные разводы: тёмные «мокрые» пятна и светлые высветы
+  for (let i = 0; i < 240; i++) {
+    const x = rnd() * W, y = rnd() * W, r = 40 + rnd() * 170;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    const dark = rnd() < 0.62;
+    const a = 0.03 + rnd() * 0.06;
+    g.addColorStop(0, dark ? `rgba(8,8,14,${a})` : `rgba(255,244,220,${a * 0.7})`);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  // мелкая крошка/зерно
+  for (let i = 0; i < 2400; i++) {
+    const x = rnd() * W, y = rnd() * W;
+    ctx.fillStyle = rnd() < 0.5 ? "rgba(0,0,0,0.05)" : "rgba(255,255,255,0.03)";
+    ctx.fillRect(x, y, 2 + rnd() * 3, 2 + rnd() * 3);
+  }
+  // атмосферное затемнение к краям карты
+  const v = ctx.createRadialGradient(W / 2, W / 2, W * 0.24, W / 2, W / 2, W * 0.72);
+  v.addColorStop(0, "rgba(0,0,0,0)");
+  v.addColorStop(1, "rgba(4,6,12,0.34)");
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, W);
 }
