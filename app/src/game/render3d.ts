@@ -7,6 +7,8 @@
  * эффекты — аддитивные кольца, веера, свечения; HUD рисуется поверх на 2D-canvas.
  */
 import * as THREE from "three";
+import { HumanRig, CatRig, heroOpts, enemyOpts } from "./characters3d";
+import type { HumanOpts } from "./characters3d";
 
 /** Масштаб: 40 пикселей мира = 1 единица сцены. */
 export const S = 40;
@@ -71,6 +73,12 @@ export class Renderer3D {
   private points: THREE.Points;
   private pointsGeo = new THREE.BufferGeometry();
   private readonly MAX_PARTICLES = 500;
+
+  // пулы объёмных ригов (персонажи/враги/коты), ключ — живой объект игры
+  private rigs = new Map<object, HumanRig>();
+  private catRigs = new Map<object, CatRig>();
+  private rigSeen = new Set<object>();
+  private catSeen = new Set<object>();
 
   private camPos = new THREE.Vector3();
   private lastW = 0; private lastH = 0;
@@ -249,7 +257,43 @@ export class Renderer3D {
     return m;
   }
 
+  /** Риг по живому объекту игры (создаётся один раз, переиспользуется). */
+  private humanRigFor(key: object, opts: HumanOpts): HumanRig {
+    let r = this.rigs.get(key);
+    if (!r) {
+      r = new HumanRig(opts);
+      this.scene.add(r.group);
+      this.rigs.set(key, r);
+    }
+    this.rigSeen.add(key);
+    return r;
+  }
+
+  private catRigFor(key: object): CatRig {
+    let r = this.catRigs.get(key);
+    if (!r) {
+      r = new CatRig();
+      this.scene.add(r.group);
+      this.catRigs.set(key, r);
+    }
+    this.catSeen.add(key);
+    return r;
+  }
+
+  /** Удаляет риги объектов, которых не было в этом кадре. */
+  private endRigs(): void {
+    for (const [k, r] of this.rigs) {
+      if (!this.rigSeen.has(k)) { this.scene.remove(r.group); this.rigs.delete(k); }
+    }
+    for (const [k, r] of this.catRigs) {
+      if (!this.catSeen.has(k)) { this.scene.remove(r.group); this.catRigs.delete(k); }
+    }
+    this.rigSeen.clear();
+    this.catSeen.clear();
+  }
+
   private endPools(): void {
+    this.endRigs();
     for (let i = this.spriteCursor; i < this.sprites.length; i++) this.sprites[i].visible = false;
     for (let i = this.flatCursor; i < this.flats.length; i++) this.flats[i].visible = false;
     for (let i = this.ringCursor; i < this.rings.length; i++) this.rings[i].visible = false;
@@ -387,13 +431,16 @@ export class Renderer3D {
       this.ring(l.x, l.y, 16 + Math.sin(v.time * 4) * 2, 0xffffff, 0.35);
     }
 
-    // трупы
+    // трупы: риг падает навзничь в первые 0.35с, затем тает
     if (!v.skip("corpses"))
       for (const c of v.corpses) {
-        const a = Math.max(0, c.life / 1.4);
-        const b = v.bake(c.sprite, false);
-        if (!b) continue;
-        this.charSprite(v, c.sprite, false, c.x, c.y, 56 * c.scale, 0, 0, c.flip, Math.min(1, a) * 0.9, undefined, (1 - a) * 6);
+        const rig = this.humanRigFor(c, enemyOpts(c.sprite));
+        rig.group.position.set(c.x / S, 0, c.y / S);
+        rig.group.scale.setScalar(c.scale * 0.95);
+        const dead01 = Math.min(1, (1.4 - c.life) / 0.35);
+        rig.update({ walk: 0, moving: false, attackT: 0, castT: 0, dead01, mounted: false, time: v.time });
+        rig.setOpacity(Math.min(1, c.life / 0.6) * 0.95);
+        rig.setTint(0xffffff);
       }
 
     // враги
@@ -415,9 +462,15 @@ export class Renderer3D {
         }
       }
       const attackT = e.attackCd > 0.7 ? (e.attackCd - 0.7) / 0.3 : 0;
-      const flip = v.target.x < e.x;
-      const tint = e.charmT > 0 ? 0xa8ffd0 : e.burnT > 0 ? 0xffc8a0 : undefined;
-      this.charSprite(v, e.sprite, false, e.x + lx, e.y + lz, hh, e.anim * 7, attackT, flip, 1, tint);
+      const tint = e.charmT > 0 ? 0xa8ffd0 : e.burnT > 0 ? 0xffc8a0 : 0xffffff;
+      const rig = this.humanRigFor(e, enemyOpts(e.sprite));
+      rig.group.position.set((e.x + lx) / S, 0, (e.y + lz) / S);
+      // рост модели пропорционален радиусу существа (база рига ~60px)
+      rig.group.scale.setScalar(scale * Math.max(0.55, (r * 3.6) / 60));
+      rig.group.rotation.y = Math.atan2(v.target.x - e.x, v.target.y - e.y);
+      rig.update({ walk: e.anim * 7, moving: true, attackT, castT: 0, dead01: 0, mounted: false, time: v.time });
+      rig.setOpacity(1);
+      rig.setTint(tint);
       if (e.flash > 0) this.glowSprite("#ffffff", e.x + lx, e.y + lz, hh * 0.75, 0.8, 0.6 * Math.min(1, e.flash / 0.12));
       if (e.charmT > 0) this.ring(e.x, e.y + r * 0.9, r * 1.5 * scale, 0x3ddc84, 0.55 + Math.sin(v.time * 6) * 0.2);
     }
@@ -442,10 +495,19 @@ export class Renderer3D {
         this.ring(p.x, p.y, 60 + Math.sin(v.time * 8) * 6, 0xff5030, 0.5);
       }
       const scalePulse = (p.swingT > 0 ? 1 + p.swingT * 0.35 : 1) * (p.rageT > 0 ? 1.35 : 1);
-      this.charSprite(
-        v, "hero-" + heroId, false, p.x, p.y, 76 * scalePulse, walk, attackT, flip,
-        alpha, p.hurtFlash > 0 ? 0xff9090 : undefined, mounted ? 34 : 0,
-      );
+      void flip;
+      const rig = this.humanRigFor(p, heroOpts(heroId));
+      rig.group.position.set(p.x / S, mounted ? 0.55 : 0, p.y / S);
+      rig.group.scale.setScalar(1.25 * scalePulse);
+      // поворот: по скорости при движении, иначе куда смотрит (к курсору)
+      const dirA = p.moving && (p.vx !== 0 || p.vy !== 0) ? Math.atan2(p.vy, p.vx) : p.facing;
+      rig.group.rotation.y = Math.atan2(Math.cos(dirA), Math.sin(dirA));
+      rig.update({
+        walk, moving: p.moving && !mounted, attackT, castT: 0,
+        dead01: p.alive ? 0 : 1, mounted, time: v.time,
+      });
+      rig.setOpacity(alpha);
+      rig.setTint(p.hurtFlash > 0 ? 0xff9090 : 0xffffff);
       if (p.shieldT > 0 && p.alive) {
         const a = 0.35 + Math.sin(v.time * 9) * 0.12;
         this.glowSprite("#b58cff", p.x, p.y, 52, 0.9, a);
@@ -453,17 +515,38 @@ export class Renderer3D {
       }
     }
 
-    // коты САТОРУ
+    // коты САТОРУ — четвероногие риги, смотрят на ближайшего врага
     for (const s2 of v.satorus) {
       this.shadow(s2.x, s2.y + 10, 16);
       const atkT = s2.swipeCd > 0.35 ? (s2.swipeCd - 0.35) / 0.2 : 0;
-      this.charSprite(v, "satoru", true, s2.x, s2.y, 56, v.time * 16, atkT, false, 1);
+      const rig = this.catRigFor(s2);
+      rig.group.position.set(s2.x / S, 0, s2.y / S);
+      rig.group.scale.setScalar(1.9);
+      let best: any = null, bd = 1e9;
+      for (const e of v.enemies) {
+        const d = (e.x - s2.x) * (e.x - s2.x) + (e.y - s2.y) * (e.y - s2.y);
+        if (d < bd) { bd = d; best = e; }
+      }
+      if (best) rig.group.rotation.y = Math.atan2(best.x - s2.x, best.y - s2.y);
+      rig.update({ walk: v.time * 16, moving: true, attackT: atkT, castT: 0, dead01: 0, mounted: false, time: v.time });
+      rig.setOpacity(1);
     }
 
-    // клоны Максима
+    // клоны Максима — полупрозрачные ледяные риги
     for (const c of v.clones) {
       this.shadow(c.x, c.y + 20, 18);
-      this.charSprite(v, "hero-maxim", false, c.x, c.y, 70, c.walk * 11, 0, false, 0.65, 0x9fd8ff);
+      const rig = this.humanRigFor(c, heroOpts("maxim"));
+      rig.group.position.set(c.x / S, 0, c.y / S);
+      rig.group.scale.setScalar(1.2);
+      let best: any = null, bd = 1e9;
+      for (const e of v.enemies) {
+        const d = (e.x - c.x) * (e.x - c.x) + (e.y - c.y) * (e.y - c.y);
+        if (d < bd) { bd = d; best = e; }
+      }
+      if (best) rig.group.rotation.y = Math.atan2(best.x - c.x, best.y - c.y);
+      rig.update({ walk: c.walk * 11, moving: true, attackT: 0, castT: 0, dead01: 0, mounted: false, time: v.time });
+      rig.setOpacity(0.65);
+      rig.setTint(0x9fd8ff);
     }
 
     // огненные драконы
