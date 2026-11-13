@@ -9,6 +9,12 @@
 import * as THREE from "three";
 import { HumanRig, CatRig, MountRig, heroOpts, enemyOpts } from "./characters3d";
 import type { MountKind } from "./characters3d";
+import { buildEnvironment } from "./environment3d";
+import type { Environment } from "./environment3d";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import type { HumanOpts } from "./characters3d";
 
 /** Масштаб: 40 пикселей мира = 1 единица сцены. */
@@ -42,7 +48,6 @@ export interface View3D {
   tempLights: any[];
   meHeroId: string;
   bake: (id: string, cat: boolean) => Baked | undefined;
-  faceOf: (heroId: string) => HTMLImageElement | undefined;
   lootColor: (kind: string) => string;
   skip: (sec: string) => boolean;
 }
@@ -82,10 +87,9 @@ export class Renderer3D {
   private rigSeen = new Set<object>();
   private catSeen = new Set<object>();
 
-  // маунты и фотолица
+  // маунты
   private mounts = new Map<object, MountRig>();
   private mountSeen = new Set<object>();
-  private faceTexCache = new Map<string, THREE.Texture>();
   private slashes: THREE.Mesh[] = [];
   private slashCursor = 0;
 
@@ -93,6 +97,11 @@ export class Renderer3D {
   private yawPrev = new Map<object, number>();
   private velPrev = new Map<object, { x: number; y: number }>();
   private lastTime = 0;
+
+  private env: Environment | null = null;
+  private envMapId = "";
+  private composer: EffectComposer | null = null;
+  private dirLight: THREE.DirectionalLight;
 
   private camPos = new THREE.Vector3();
   private lastW = 0; private lastH = 0;
@@ -107,11 +116,21 @@ export class Renderer3D {
     this.scene.background = new THREE.Color(0x07080c);
     this.scene.fog = new THREE.Fog(0x07080c, 34, 95);
 
-    const hemi = new THREE.HemisphereLight(0x9aa8cc, 0x241c14, 1.15);
+    const hemi = new THREE.HemisphereLight(0x9aa8cc, 0x241c14, 1.0);
     this.scene.add(hemi);
-    const dir = new THREE.DirectionalLight(0xfff0d8, 1.1);
-    dir.position.set(14, 26, 8);
-    this.scene.add(dir);
+    this.dirLight = new THREE.DirectionalLight(0xfff0d8, 1.5);
+    this.dirLight.position.set(14, 26, 8);
+    this.dirLight.castShadow = true;
+    this.dirLight.shadow.mapSize.set(1024, 1024);
+    const sc = this.dirLight.shadow.camera;
+    sc.left = -24; sc.right = 24; sc.top = 24; sc.bottom = -24;
+    sc.near = 2; sc.far = 90;
+    this.dirLight.shadow.bias = -0.0006;
+    this.scene.add(this.dirLight);
+    this.scene.add(this.dirLight.target);
+    // мягкие тени
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     // тёмная «пустота» под картой
     const voidMat = new THREE.MeshBasicMaterial({ color: 0x05060a });
@@ -136,6 +155,17 @@ export class Renderer3D {
     this.points = new THREE.Points(this.pointsGeo, mat);
     this.points.frustumCulled = false;
     this.scene.add(this.points);
+
+    // постобработка: bloom для свечения магии и ламп (как в Diablo 3)
+    try {
+      this.composer = new EffectComposer(this.renderer);
+      this.composer.addPass(new RenderPass(this.scene, this.camera));
+      const bloom = new UnrealBloomPass(new THREE.Vector2(1280, 720), 0.5, 0.65, 0.82);
+      this.composer.addPass(bloom);
+      this.composer.addPass(new OutputPass());
+    } catch {
+      this.composer = null;
+    }
   }
 
   setSize(w: number, h: number): void {
@@ -145,6 +175,7 @@ export class Renderer3D {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.composer?.setSize(w, h);
     this.glCanvas.style.width = `${w}px`;
     this.glCanvas.style.height = `${h}px`;
   }
@@ -316,26 +347,6 @@ export class Renderer3D {
     }
     this.mountSeen.add(key);
     return m;
-  }
-
-  /** Круглая текстура фотолица героя (кэш). */
-  private faceTex(v: View3D, heroId: string): THREE.Texture | undefined {
-    const cached = this.faceTexCache.get(heroId);
-    if (cached) return cached;
-    const img = v.faceOf(heroId);
-    if (!img || !img.complete || img.naturalWidth === 0) return undefined;
-    const c = document.createElement("canvas");
-    c.width = c.height = 128;
-    const ctx = c.getContext("2d")!;
-    ctx.beginPath();
-    ctx.arc(64, 64, 62, 0, TWO_PI);
-    ctx.clip();
-    const m = Math.min(img.naturalWidth, img.naturalHeight);
-    ctx.drawImage(img, (img.naturalWidth - m) / 2, (img.naturalHeight - m) / 2, m, m, 0, 0, 128, 128);
-    const t = new THREE.CanvasTexture(c);
-    t.colorSpace = THREE.SRGBColorSpace;
-    this.faceTexCache.set(heroId, t);
-    return t;
   }
 
   private acquireSlash(): THREE.Mesh {
@@ -517,14 +528,23 @@ export class Renderer3D {
       this.groundTex = new THREE.CanvasTexture(v.mapCanvas);
       this.groundTex.colorSpace = THREE.SRGBColorSpace;
       this.groundTex.anisotropy = 8;
-      const mat = new THREE.MeshLambertMaterial({ map: this.groundTex });
+      // окружение карты пересобирается вместе с землёй
+      if (this.env) { this.scene.remove(this.env.group); this.env = null; }
+      this.env = buildEnvironment(v.mapId);
+      this.scene.add(this.env.group);
+      const mat = new THREE.MeshStandardMaterial({ map: this.groundTex, roughness: this.env.groundRoughness, metalness: 0.03 });
       const world = v.mapCanvas.width / S;
       this.ground = new THREE.Mesh(new THREE.PlaneGeometry(world, world), mat);
       this.ground.rotation.x = -Math.PI / 2;
       this.ground.position.set(world / 2, 0, world / 2);
+      this.ground.receiveShadow = true;
       this.scene.add(this.ground);
       this.groundMapId = v.mapId + String(v.mapCanvas.width);
     }
+    this.env?.update(v.time);
+    // свет следует за камерой, чтобы тени всегда были в кадре
+    this.dirLight.position.set(cx + 14, 26, cz + 8);
+    this.dirLight.target.position.set(cx, 0, cz);
 
     // декали (кровь, следы)
     if (!v.skip("decals"))
@@ -637,9 +657,6 @@ export class Renderer3D {
         this.ring(p.x, p.y + 18, 50, 0xffc85a, 0.3, 0.08);
       }
       rig.group.position.set(p.x / S, seatY, p.y / S);
-      // фотолицо героя
-      const ft = this.faceTex(v, heroId);
-      if (ft) rig.setFace(ft);
       // дуговой взмах ближнего боя (Никита)
       if (heroId === "nikita" && p.swingT > 0 && p.alive) {
         const at = 1 - Math.min(1, p.swingT / 0.2);
@@ -778,6 +795,7 @@ export class Renderer3D {
     for (; li < this.lights.length; li++) this.lights[li].intensity = 0;
 
     this.endPools();
-    this.renderer.render(this.scene, this.camera);
+    if (this.composer) this.composer.render();
+    else this.renderer.render(this.scene, this.camera);
   }
 }

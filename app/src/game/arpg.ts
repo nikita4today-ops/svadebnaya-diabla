@@ -2858,7 +2858,6 @@ export class Arpg {
       tempLights: this.tempLights,
       meHeroId: this.hero.id,
       bake: (id, cat) => this.bakePuppet(id, cat),
-      faceOf: (heroId) => this.faces.get(heroId),
       lootColor: (kind) => LOOT[kind as LootKind].color,
       skip: (sec) => this.skipSec.has(sec),
     };
