@@ -7,7 +7,8 @@
  * эффекты — аддитивные кольца, веера, свечения; HUD рисуется поверх на 2D-canvas.
  */
 import * as THREE from "three";
-import { HumanRig, CatRig, heroOpts, enemyOpts } from "./characters3d";
+import { HumanRig, CatRig, MountRig, heroOpts, enemyOpts } from "./characters3d";
+import type { MountKind } from "./characters3d";
 import type { HumanOpts } from "./characters3d";
 
 /** Масштаб: 40 пикселей мира = 1 единица сцены. */
@@ -41,6 +42,7 @@ export interface View3D {
   tempLights: any[];
   meHeroId: string;
   bake: (id: string, cat: boolean) => Baked | undefined;
+  faceOf: (heroId: string) => HTMLImageElement | undefined;
   lootColor: (kind: string) => string;
   skip: (sec: string) => boolean;
 }
@@ -79,6 +81,13 @@ export class Renderer3D {
   private catRigs = new Map<object, CatRig>();
   private rigSeen = new Set<object>();
   private catSeen = new Set<object>();
+
+  // маунты и фотолица
+  private mounts = new Map<object, MountRig>();
+  private mountSeen = new Set<object>();
+  private faceTexCache = new Map<string, THREE.Texture>();
+  private slashes: THREE.Mesh[] = [];
+  private slashCursor = 0;
 
   // сглаживание поворотов и оценка ускорения для наклонов
   private yawPrev = new Map<object, number>();
@@ -144,6 +153,18 @@ export class Renderer3D {
   project(wx: number, heightPx: number, wz: number, outW: number, outH: number): { x: number; y: number; vis: boolean } {
     const v = new THREE.Vector3(wx / S, heightPx / S, wz / S).project(this.camera);
     return { x: (v.x * 0.5 + 0.5) * outW, y: (-v.y * 0.5 + 0.5) * outH, vis: v.z < 1 && v.x > -1.15 && v.x < 1.15 && v.y > -1.15 && v.y < 1.15 };
+  }
+
+  /** Обратная проекция: экранные пиксели → мировые px на плоскости земли. */
+  unproject(sx: number, sy: number, outW: number, outH: number): { x: number; y: number } {
+    const ndc = new THREE.Vector3((sx / outW) * 2 - 1, -(sy / outH) * 2 + 1, 0.5);
+    ndc.unproject(this.camera);
+    const dir = ndc.sub(this.camera.position).normalize();
+    const t = -this.camera.position.y / dir.y;
+    return {
+      x: (this.camera.position.x + dir.x * t) * S,
+      y: (this.camera.position.z + dir.z * t) * S,
+    };
   }
 
   dispose(): void {
@@ -285,6 +306,79 @@ export class Renderer3D {
     return r;
   }
 
+  /** Маунт по игроку (создаётся один раз, переиспользуется). */
+  private mountFor(key: object, kind: MountKind): MountRig {
+    let m = this.mounts.get(key);
+    if (!m) {
+      m = new MountRig(kind);
+      this.scene.add(m.group);
+      this.mounts.set(key, m);
+    }
+    this.mountSeen.add(key);
+    return m;
+  }
+
+  /** Круглая текстура фотолица героя (кэш). */
+  private faceTex(v: View3D, heroId: string): THREE.Texture | undefined {
+    const cached = this.faceTexCache.get(heroId);
+    if (cached) return cached;
+    const img = v.faceOf(heroId);
+    if (!img || !img.complete || img.naturalWidth === 0) return undefined;
+    const c = document.createElement("canvas");
+    c.width = c.height = 128;
+    const ctx = c.getContext("2d")!;
+    ctx.beginPath();
+    ctx.arc(64, 64, 62, 0, TWO_PI);
+    ctx.clip();
+    const m = Math.min(img.naturalWidth, img.naturalHeight);
+    ctx.drawImage(img, (img.naturalWidth - m) / 2, (img.naturalHeight - m) / 2, m, m, 0, 0, 128, 128);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    this.faceTexCache.set(heroId, t);
+    return t;
+  }
+
+  private acquireSlash(): THREE.Mesh {
+    if (this.slashCursor < this.slashes.length) {
+      const m = this.slashes[this.slashCursor++];
+      m.visible = true;
+      return m;
+    }
+    const m = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }),
+    );
+    m.rotation.x = -Math.PI / 2;
+    this.slashes.push(m);
+    this.scene.add(m);
+    this.slashCursor++;
+    return m;
+  }
+
+  /** Дуговой взмах оружия (кольцевой сектор, как в Diablo). */
+  private slash(wx: number, wz: number, a0: number, arcLen: number, rPx: number, color: number, alpha: number, yU = 0.55): void {
+    const m = this.acquireSlash();
+    const segs = 14;
+    const verts: number[] = [];
+    for (let i = 0; i <= segs; i++) {
+      const a = a0 + (arcLen * i) / segs;
+      verts.push(Math.cos(a) * 0.55, Math.sin(a) * 0.55, 0);
+      verts.push(Math.cos(a), Math.sin(a), 0);
+    }
+    const idx: number[] = [];
+    for (let i = 0; i < segs; i++) {
+      const b = i * 2;
+      idx.push(b, b + 1, b + 2, b + 1, b + 3, b + 2);
+    }
+    const g = m.geometry as THREE.BufferGeometry;
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+    g.setIndex(idx);
+    (m.material as THREE.MeshBasicMaterial).color.setHex(color);
+    (m.material as THREE.MeshBasicMaterial).opacity = alpha;
+    m.scale.set(rPx / S, rPx / S, 1);
+    m.position.set(wx / S, yU, wz / S);
+  }
+
   /** Удаляет риги объектов, которых не было в этом кадре. */
   private endRigs(): void {
     for (const [k, r] of this.rigs) {
@@ -296,8 +390,12 @@ export class Renderer3D {
     for (const [k, r] of this.catRigs) {
       if (!this.catSeen.has(k)) { this.scene.remove(r.group); this.catRigs.delete(k); this.yawPrev.delete(k); }
     }
+    for (const [k, m] of this.mounts) {
+      if (!this.mountSeen.has(k)) { this.scene.remove(m.group); this.mounts.delete(k); }
+    }
     this.rigSeen.clear();
     this.catSeen.clear();
+    this.mountSeen.clear();
   }
 
   /** Плавный доворот к целевому углу по кратчайшей дуге (ограниченная угл. скорость). */
@@ -319,7 +417,8 @@ export class Renderer3D {
     for (let i = this.flatCursor; i < this.flats.length; i++) this.flats[i].visible = false;
     for (let i = this.ringCursor; i < this.rings.length; i++) this.rings[i].visible = false;
     for (let i = this.fanCursor; i < this.fans.length; i++) this.fans[i].visible = false;
-    this.spriteCursor = 0; this.flatCursor = 0; this.ringCursor = 0; this.fanCursor = 0;
+    for (let i = this.slashCursor; i < this.slashes.length; i++) this.slashes[i].visible = false;
+    this.spriteCursor = 0; this.flatCursor = 0; this.ringCursor = 0; this.fanCursor = 0; this.slashCursor = 0;
   }
 
   /** Билборд персонажа из запечённых кадров куклы. */
@@ -486,6 +585,12 @@ export class Renderer3D {
       }
       const attackT = e.attackCd > 0.7 ? (e.attackCd - 0.7) / 0.3 : 0;
       const tint = e.charmT > 0 ? 0xa8ffd0 : e.burnT > 0 ? 0xffc8a0 : 0xffffff;
+      // взмах ближнего боя: красная дуга в сторону цели
+      if (!e.kind.ranged && e.attackCd > 0.7) {
+        const at = (e.attackCd - 0.7) / 0.3;
+        const edir = Math.atan2(v.target.y - e.y, v.target.x - e.x);
+        this.slash(e.x, e.y, edir - 1.0 + at * 1.5, 0.7, 36 + e.radius, 0xff5a3c, (1 - at) * 0.55, 0.5);
+      }
       const rig = this.humanRigFor(e, enemyOpts(e.sprite));
       rig.group.position.set((e.x + lx) / S, 0, (e.y + lz) / S);
       // рост модели пропорционален радиусу существа (база рига ~60px)
@@ -507,12 +612,7 @@ export class Renderer3D {
       const mounted = p.mountT > 0 && p.alive;
       const walk = p.moving && !mounted ? p.walkPhase * 11 : 0;
       const attackT = p.swingT > 0 ? 1 - Math.min(1, p.swingT / 0.18) : 0;
-      if (mounted) {
-        // маунт: светящаяся платформа в цвете героя
-        this.flatCircle(p.x, p.y + 18, 52, 30, 0x1a1610, 0.55, 0.08);
-        this.ring(p.x, p.y + 18, 50, 0xffc85a, 0.6, 0.1);
-        this.glowSprite(p.hero.themeColor ?? "#8fb0ff", p.x, p.y, 52, 0.35, 0.55);
-      }
+      // маунт рисуется после рига (нужен yaw) — см. ниже
       if (p.rageT > 0 && p.alive) {
         this.glowSprite("#ff3c1e", p.x, p.y, 95, 0.9, 0.5 + Math.sin(v.time * 10) * 0.15);
         this.ring(p.x, p.y, 60 + Math.sin(v.time * 8) * 6, 0xff5030, 0.5);
@@ -520,11 +620,31 @@ export class Renderer3D {
       const scalePulse = (p.swingT > 0 ? 1 + p.swingT * 0.35 : 1) * (p.rageT > 0 ? 1.35 : 1);
       void flip;
       const rig = this.humanRigFor(p, heroOpts(heroId));
-      rig.group.position.set(p.x / S, mounted ? 0.55 : 0, p.y / S);
       rig.group.scale.setScalar(1.25 * scalePulse);
       // поворот: по скорости при движении, иначе куда смотрит (к курсору) — с плавным доворотом
       const dirA = p.moving && (p.vx !== 0 || p.vy !== 0) ? Math.atan2(p.vy, p.vx) : p.facing;
-      rig.group.rotation.y = this.yawOf(p, Math.atan2(Math.cos(dirA), Math.sin(dirA)), dt);
+      const rigYaw = this.yawOf(p, Math.atan2(Math.cos(dirA), Math.sin(dirA)), dt);
+      rig.group.rotation.y = rigYaw;
+      // объёмный маунт под героем
+      let seatY = 0;
+      if (mounted) {
+        const mk: MountKind = heroId === "nikita" ? "zamboni" : heroId === "maxim" ? "frog" : heroId === "dasha" ? "batmobile" : "hippogriff";
+        const mr = this.mountFor(p, mk);
+        mr.group.position.set(p.x / S, 0, p.y / S);
+        mr.group.rotation.y = rigYaw;
+        mr.update(v.time, p.moving);
+        seatY = mr.seatY * 0.8;
+        this.ring(p.x, p.y + 18, 50, 0xffc85a, 0.3, 0.08);
+      }
+      rig.group.position.set(p.x / S, seatY, p.y / S);
+      // фотолицо героя
+      const ft = this.faceTex(v, heroId);
+      if (ft) rig.setFace(ft);
+      // дуговой взмах ближнего боя (Никита)
+      if (heroId === "nikita" && p.swingT > 0 && p.alive) {
+        const at = 1 - Math.min(1, p.swingT / 0.2);
+        this.slash(p.x, p.y, p.facing - 1.0 + at * 1.6, 0.8, 115 * scalePulse, 0xcfeaff, (1 - at) * 0.8, 0.55);
+      }
       // инерция: ускорение вперёд/назад → продольный наклон, боковое → крен в повороте
       const pv = this.velPrev.get(p);
       let ax = 0, ay = 0;
@@ -600,6 +720,15 @@ export class Renderer3D {
     if (!v.skip("projs"))
       for (const pr of v.projs) {
         this.glowSprite(pr.color, pr.x, pr.y, pr.r * 2.4, 0.75, 0.95);
+        // белое раскалённое ядро
+        this.glowSprite("#ffffff", pr.x, pr.y, pr.r * 1.05, 0.75, 0.9);
+        // энергетический шлейф позади снаряда
+        const spd = Math.hypot(pr.vx, pr.vy);
+        if (spd > 1) {
+          const ux = pr.vx / spd, uy = pr.vy / spd;
+          const bx = pr.x - ux * pr.r * 8, by = pr.y - uy * pr.r * 8;
+          this.fan(bx, by, Math.atan2(pr.vy, pr.vx), 0.05, pr.r * 8, new THREE.Color(pr.color).getHex(), 0.3);
+        }
       }
 
     // частицы

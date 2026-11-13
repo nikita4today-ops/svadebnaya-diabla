@@ -285,6 +285,17 @@ export class HumanRig {
     this.tintC.setHex(hex);
     for (const p of this.parts) p.mat.color.copy(p.base).multiply(this.tintC);
   }
+
+  /** Фотолицо героя: круглая текстура на передней стороне головы. */
+  private faceMesh: THREE.Mesh | null = null;
+  setFace(tex: THREE.Texture): void {
+    if (this.faceMesh) return;
+    const mat = new THREE.MeshLambertMaterial({ map: tex, transparent: true });
+    const m = new THREE.Mesh(box(0.26, 0.26, 0.02), mat);
+    m.position.set(0, 0.17, 0.155);
+    this.headG.add(m);
+    this.faceMesh = m;
+  }
 }
 
 // ---------- внешность героев и врагов ----------
@@ -415,4 +426,126 @@ export class CatRig {
   }
 
   setOpacity(a: number): void { for (const p of this.parts) p.mat.opacity = a; }
+}
+
+// ---------- маунты героев ----------
+
+export type MountKind = "zamboni" | "frog" | "batmobile" | "hippogriff";
+
+/** Маунт под героем: замбони (Никита), жаба (Максим), бэтмобиль (Даша), гиппогриф (Вика). */
+export class MountRig {
+  group = new THREE.Group();
+  /** Высота посадки героя над землёй. */
+  readonly seatY: number;
+  private wingL: THREE.Group | null = null;
+  private wingR: THREE.Group | null = null;
+  private bodyG = new THREE.Group();
+  private wheels: THREE.Mesh[] = [];
+  private hopBaseY = 0;
+
+  constructor(kind: MountKind) {
+    this.group.add(this.bodyG);
+    const add = (g: THREE.BufferGeometry, color: number, x = 0, y = 0, z = 0): THREE.Mesh => {
+      const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color }));
+      m.position.set(x, y, z);
+      this.bodyG.add(m);
+      return m;
+    };
+    const wheel = (x: number, z: number, r: number): void => {
+      const geo = new THREE.CylinderGeometry(r, r, 0.14, 12);
+      const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x14141a }));
+      m.rotation.z = Math.PI / 2;
+      m.position.set(x, r, z);
+      this.bodyG.add(m);
+      this.wheels.push(m);
+    };
+
+    if (kind === "zamboni") {
+      // синяя льдозаливочная машина: корпус, кабина, бак, щётка сзади
+      this.seatY = 1.05;
+      add(box(1.15, 0.5, 2.0), 0x2a5a9a, 0, 0.55, 0);
+      add(box(0.85, 0.5, 0.75), 0x3a7ac0, 0, 1.05, -0.35);
+      add(box(0.65, 0.3, 0.06), 0xbfe4ff, 0, 1.08, 0.04); // лобовое стекло
+      add(box(0.7, 0.4, 0.7), 0xd8d8de, 0, 1.0, -1.0); // бак для воды
+      add(box(1.2, 0.16, 0.3), 0x8a8a92, 0, 0.28, -1.15); // щётка
+      add(box(0.3, 0.1, 0.08), 0xffd24a, -0.35, 0.6, 1.02); // фары
+      add(box(0.3, 0.1, 0.08), 0xffd24a, 0.35, 0.6, 1.02);
+      wheel(-0.55, 0.65, 0.26); wheel(0.55, 0.65, 0.26);
+      wheel(-0.55, -0.65, 0.26); wheel(0.55, -0.65, 0.26);
+    } else if (kind === "frog") {
+      // жаба: приплюснутое тело, глаза на стебельках, задние лапы
+      this.seatY = 0.72;
+      this.hopBaseY = 0;
+      const body = add(sph(0.62), 0x5a8a3a, 0, 0.45, 0);
+      body.scale.set(1.1, 0.62, 1.25);
+      const belly = add(sph(0.5), 0x7ab54a, 0, 0.32, 0.1);
+      belly.scale.set(0.95, 0.45, 1.05);
+      for (const sx of [-1, 1]) {
+        add(box(0.08, 0.22, 0.08), 0x5a8a3a, sx * 0.28, 0.78, 0.3); // стебелёк глаза
+        add(sph(0.13), 0xf0f0e8, sx * 0.28, 0.92, 0.3);
+        add(sph(0.055), 0x14141a, sx * 0.28, 0.94, 0.4);
+        // задние лапы
+        const leg = add(box(0.22, 0.3, 0.5), 0x4a7a30, sx * 0.55, 0.28, -0.35);
+        leg.rotation.x = 0.5;
+      }
+    } else if (kind === "batmobile") {
+      // бэтмобиль: низкий чёрный клин, плавник, жёлтые фары
+      this.seatY = 0.72;
+      add(box(0.95, 0.3, 2.2), 0x14141a, 0, 0.38, 0);
+      const nose = add(box(0.7, 0.2, 0.7), 0x1a1a22, 0, 0.42, 1.25);
+      nose.rotation.x = -0.15;
+      add(box(0.55, 0.28, 0.7), 0x22222c, 0, 0.62, -0.25); // кабина
+      add(box(0.1, 0.55, 0.5), 0x1a1a22, -0.28, 0.75, -0.95); // плавники
+      add(box(0.1, 0.55, 0.5), 0x1a1a22, 0.28, 0.75, -0.95);
+      add(box(0.22, 0.09, 0.06), 0xffd24a, -0.25, 0.42, 1.6); // фары
+      add(box(0.22, 0.09, 0.06), 0xffd24a, 0.25, 0.42, 1.6);
+      wheel(-0.5, 0.75, 0.26); wheel(0.5, 0.75, 0.26);
+      wheel(-0.5, -0.75, 0.3); wheel(0.5, -0.75, 0.3);
+    } else {
+      // гиппогриф: тело коня, голова орла с клювом, машущие крылья
+      this.seatY = 1.12;
+      const body = add(sph(0.62), 0x8a7a5a, 0, 0.85, -0.1);
+      body.scale.set(0.95, 0.78, 1.4);
+      add(sph(0.22), 0xc9b18a, 0, 1.25, 0.62); // голова
+      const beak = add(cone(0.09, 0.3), 0xe8c84a, 0, 1.2, 0.85);
+      beak.rotation.x = Math.PI / 2;
+      add(sph(0.035), 0x14141a, -0.09, 1.3, 0.72); // глаза
+      add(sph(0.035), 0x14141a, 0.09, 1.3, 0.72);
+      // крылья: плоские панели на плечах, сложены назад
+      for (const sx of [-1, 1]) {
+        const w = new THREE.Group();
+        w.position.set(sx * 0.32, 1.08, -0.15);
+        this.bodyG.add(w);
+        const panel = new THREE.Mesh(box(0.7, 0.05, 0.5), new THREE.MeshLambertMaterial({ color: 0xc9b18a }));
+        panel.position.set(sx * 0.38, 0, -0.05);
+        panel.rotation.y = sx * 0.35;
+        w.add(panel);
+        const tip = new THREE.Mesh(box(0.4, 0.04, 0.34), new THREE.MeshLambertMaterial({ color: 0xa8946a }));
+        tip.position.set(sx * 0.8, 0, -0.22);
+        tip.rotation.y = sx * 0.6;
+        w.add(tip);
+        if (sx < 0) this.wingL = w; else this.wingR = w;
+      }
+      const tail = add(cone(0.14, 0.6), 0x6a5c42, 0, 0.85, -1.0);
+      tail.rotation.x = -Math.PI / 2 - 0.3;
+      for (const sx of [-0.25, 0.25]) for (const sz of [0.45, -0.55]) {
+        add(box(0.12, 0.55, 0.12), 0x6a5c42, sx, 0.28, sz);
+      }
+    }
+  }
+
+  /** Анимация: крылья гиппогрифа, колёса машин, подскок жабы. */
+  update(time: number, moving: boolean): void {
+    if (this.wingL && this.wingR) {
+      const flap = Math.sin(time * 9) * (moving ? 0.55 : 0.25);
+      this.wingL.rotation.z = 0.15 + flap;
+      this.wingR.rotation.z = -0.15 - flap;
+      this.bodyG.position.y = Math.abs(Math.sin(time * 4.5)) * (moving ? 0.1 : 0.04);
+    } else if (this.wheels.length > 0) {
+      if (moving) for (const w of this.wheels) w.rotation.x += 0.35;
+    } else {
+      // жаба: подпрыгивает при движении
+      this.bodyG.position.y = this.hopBaseY + (moving ? Math.abs(Math.sin(time * 7)) * 0.22 : Math.sin(time * 2) * 0.03 + 0.03);
+    }
+  }
 }

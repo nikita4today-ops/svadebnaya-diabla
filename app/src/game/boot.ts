@@ -34,6 +34,7 @@ export function startGame(canvas: HTMLCanvasElement): void {
     lvl: () => game.debugLvl(),
   };
   (window as unknown as { __dbg2?: () => unknown }).__dbg2 = () => game.debugInfo2();
+  (window as unknown as { __dbgAim?: () => unknown }).__dbgAim = () => game.debugAim();
   (window as unknown as { __dbg?: () => unknown }).__dbg = () => game.debugInfo();
   // первый отрисованный кадр — страница играбельна
   const markReady = () => {

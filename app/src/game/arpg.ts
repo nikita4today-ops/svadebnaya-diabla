@@ -301,6 +301,7 @@ export class Arpg {
 
   // мышь
   private mx = 0; private my = 0; private mouseDown = false;
+  private aimX = 0; private aimY = 0; // мировая точка под курсором
   private cardRects: Array<{ x: number; y: number; w: number; h: number }> = [];
   private menuBtns: Array<{ x: number; y: number; w: number; h: number; act: string }> = [];
   private unsub: Array<() => void> = [];
@@ -772,9 +773,15 @@ export class Arpg {
       p.cdRushT -= dt; p.berserkT -= dt; p.invulnT -= dt;
     }
 
-    // прицел локального игрока
-    const camX = this.camX(), camY = this.camY();
-    this.facing = Math.atan2(camY + this.my - this.py, camX + this.mx - this.px);
+    // прицел локального игрока: мировая точка под курсором
+    // в 3D-режиме — луч мыши на плоскость земли, в 2D-запасном — смещение камеры
+    if (this.r3d) {
+      const wpt = this.r3d.unproject(this.mx, this.my, this.w, this.h);
+      this.aimX = wpt.x; this.aimY = wpt.y;
+    } else {
+      this.aimX = this.camX() + this.mx; this.aimY = this.camY() + this.my;
+    }
+    this.facing = Math.atan2(this.aimY - this.py, this.aimX - this.px);
 
     // движение локального игрока (своя позиция авторитетна и в коопе)
     if (this.me.alive) this.updateLocalMovement(dt);
@@ -1070,7 +1077,24 @@ export class Arpg {
   }
 
   /** Локальная попытка каста: на клиенте уходит хосту, иначе исполняется сразу. */
+  /** Враг под курсором (для ближней атаки ЛКМ, как в Diablo 3). */
+  private hoveredEnemy(): Enemy | null {
+    let best: Enemy | null = null, bd = Infinity;
+    for (const e of this.enemies) {
+      if (e.charmT > 0) continue;
+      const d = Math.hypot(e.x - this.aimX, e.y - this.aimY);
+      if (d < e.radius + 18 && d < bd) { bd = d; best = e; }
+    }
+    return best;
+  }
+
   private tryCast(k: "basic" | "q" | "e" | "r" | "t" | "f"): void {
+    // ближняя атака Никиты: бьёт только по наведённому врагу и разворачивается точно к нему
+    if (k === "basic" && this.hero.id === "nikita") {
+      const he = this.hoveredEnemy();
+      if (!he) return;
+      this.facing = Math.atan2(he.y - this.py, he.x - this.px);
+    }
     if (k === "t" && this.me.sk.t === 0) {
       this.floaters.push({ x: this.px, y: this.py - 34, text: this.me.level < ULT_UNLOCK_LEVEL ? `УЛЬТ ОТКРОЕТСЯ НА ${ULT_UNLOCK_LEVEL} УРОВНЕ` : "ВЛОЖИ ОЧКО В УЛЬТ — КЛАВИША 4", color: "#ff9a5a", life: 1.2 });
       return;
@@ -2502,6 +2526,11 @@ export class Arpg {
   debugInfo2(): Record<string, unknown> {
     return { ws: this.waveState, bt: +this.breakT.toFixed(1), gold: this.me.gold, pts: this.me.skillPts, sk: this.me.sk, buys: this.me.buys, shop: this.shopOpen, tg: this.telegraphs.length, kills: this.me.kills, paused: this.netPaused, met: this.meteorAnnounced };
   }
+  /** Отладка прицела: мировая точка под курсором и её обратная проекция на экран. */
+  debugAim(): Record<string, unknown> {
+    const scr = this.r3d ? this.r3d.project(this.aimX, 0, this.aimY, this.w, this.h) : null;
+    return { aimX: this.aimX, aimY: this.aimY, facing: this.facing, scrX: scr?.x, scrY: scr?.y };
+  }
   debugInfo(): Record<string, unknown> {
     return {
       state: this.state, px: this.px, py: this.py, camX: this.camX(), camY: this.camY(),
@@ -2829,6 +2858,7 @@ export class Arpg {
       tempLights: this.tempLights,
       meHeroId: this.hero.id,
       bake: (id, cat) => this.bakePuppet(id, cat),
+      faceOf: (heroId) => this.faces.get(heroId),
       lootColor: (kind) => LOOT[kind as LootKind].color,
       skip: (sec) => this.skipSec.has(sec),
     };
@@ -2853,6 +2883,22 @@ export class Arpg {
       }
       if (e.disarmT > 0) { ctx.fillStyle = "#ff5252"; ctx.font = "bold 13px Georgia"; ctx.fillText("ОБЕЗОРУЖЕН", top.x, top.y - 8); }
       if (e.charmT > 0) { ctx.fillStyle = "#3ddc84"; ctx.font = "bold 11px Georgia"; ctx.fillText("ПОДЧИНЁН", top.x, top.y - 8); }
+    }
+    // кольцо наведения ЛКМ (ближний бой Никиты): подсветка цели под курсором
+    if (this.me.alive && this.hero.id === "nikita") {
+      const he = this.hoveredEnemy();
+      if (he) {
+        const c0 = r3.project(he.x, 2, he.y, this.w, this.h);
+        const cx = r3.project(he.x + he.radius * 1.4, 2, he.y, this.w, this.h);
+        const cz = r3.project(he.x, 2, he.y + he.radius * 1.4, this.w, this.h);
+        if (c0.vis) {
+          ctx.strokeStyle = "rgba(255,84,60,0.9)";
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.ellipse(c0.x, c0.y, Math.max(8, Math.abs(cx.x - c0.x)), Math.max(4, Math.abs(cz.y - c0.y)), 0, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
     }
     // удалённые игроки: имя, HP, воскрешение
     for (const p of this.players) {
